@@ -1179,19 +1179,6 @@ fn handle_payment_challenge(
         }
     };
 
-    // Check if near CLI is available
-    let near_available = std::process::Command::new("near")
-        .arg("--version")
-        .output()
-        .is_ok();
-
-    if !near_available {
-        eprintln!("⚠️  'near' CLI not found. Cannot auto-pay.");
-        eprintln!("   Install: npm install -g near-cli");
-        eprintln!("   Or pay manually and retry with payment receipt.");
-        std::process::exit(1);
-    }
-
     // Check payment limits
     let amount_near: f64 = challenge.amount.parse().unwrap_or(0.0);
     let max_per_request: f64 = cfg.payment.max_per_request.parse().unwrap_or(0.01);
@@ -1203,29 +1190,20 @@ fn handle_payment_challenge(
         std::process::exit(1);
     }
 
-    eprintln!("🔄 Auto-paying with near CLI...");
-    
-    // Determine network from account ID
-    let network = if account.ends_with(".testnet") || account.contains(".testnet.") {
-        "testnet"
-    } else if account.ends_with(".near") || account.contains(".near.") {
-        "mainnet"
+    // Determine RPC URL from network
+    let rpc_url = if account.ends_with(".testnet") || account.contains(".testnet.") {
+        "https://rpc.testnet.near.org"
     } else {
-        "testnet"
+        "https://rpc.mainnet.near.org"
     };
 
-    // Execute payment
-    let tx_hash = if let Some(ref token_contract) = challenge.token {
-        if token_contract == "NEAR" || token_contract.is_empty() {
-            // Native NEAR transfer
-            pay_near(&account, &challenge.recipient, &challenge.amount, network)?
-        } else {
-            // FT transfer
-            pay_ft(&account, &challenge.recipient, &challenge.amount, token_contract, network)?
-        }
+    let token = challenge.token.as_deref().unwrap_or("NEAR");
+    eprintln!("🔄 Auto-paying {} {} to {} (via RPC, no CLI)...", challenge.amount, token, challenge.recipient);
+
+    let tx_hash = if token == "NEAR" || token.is_empty() {
+        pay_near(&account, &challenge.recipient, &challenge.amount, rpc_url)?
     } else {
-        // Default to NEAR
-        pay_near(&account, &challenge.recipient, &challenge.amount, network)?
+        pay_intents(&account, &challenge.recipient, &challenge.amount, token, rpc_url)?
     };
 
     eprintln!("✅ Payment sent! tx: {}", tx_hash);
@@ -1269,81 +1247,149 @@ fn handle_payment_challenge(
     Ok(())
 }
 
-/// Pay native NEAR
-fn pay_near(from: &str, to: &str, amount: &str, network: &str) -> Result<String> {
-    let output = std::process::Command::new("near")
-        .args(["send", from, to, amount, "--networkId", network])
-        .output()
-        .context("Failed to run near CLI")?;
+/// Pay native NEAR via direct RPC (no CLI dependency)
+fn pay_near(from: &str, to: &str, amount: &str, rpc_url: &str) -> Result<String> {
+    use near_primitives::transaction::{Transaction, TransactionV0, Action, TransferAction};
+    use near_primitives::types::AccountId;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("near send failed: {}", stderr);
-    }
-
-    // Parse tx hash from output
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_tx_hash(&stdout)
-}
-
-/// Pay FT token
-fn pay_ft(from: &str, to: &str, amount: &str, token_contract: &str, network: &str) -> Result<String> {
-    // Convert NEAR amount to yocto (assuming 24 decimals)
+    let signer_account_id: AccountId = from.parse().context("Invalid signer")?;
+    let receiver_id: AccountId = to.parse().context("Invalid receiver")?;
     let amount_near: f64 = amount.parse().context("Invalid amount")?;
     let amount_yocto = (amount_near * 1e24) as u128;
 
-    let msg = format!(
-        r#"{{"receiver_id":"{}","amount":"{}","msg":""}}"#,
-        to, amount_yocto
-    );
+    let secret_key = load_signer_key(from)?;
+    let signer = InMemorySigner::from_secret_key(signer_account_id.clone(), secret_key);
+    let public_key = signer.public_key.clone();
 
-    let output = std::process::Command::new("near")
-        .args([
-            "call", token_contract, "ft_transfer_call",
-            &msg,
-            "--accountId", from,
-            "--depositYocto", "1",
-            "--gas", "100000000000000",
-            "--networkId", network,
-        ])
-        .output()
-        .context("Failed to run near CLI")?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = JsonRpcClient::connect(rpc_url);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("near call ft_transfer_call failed: {}", stderr);
-    }
+        // Fetch nonce + block hash
+        let query = methods::query::RpcQueryRequest {
+            block_reference: near_primitives::types::BlockReference::latest(),
+            request: near_primitives::views::QueryRequest::ViewAccessKey {
+                account_id: signer_account_id.clone(),
+                public_key: public_key.clone(),
+            },
+        };
+        let resp = client.call(query).await.context("Failed to get access key")?;
+        let nonce = match resp.kind {
+            near_jsonrpc_primitives::types::query::QueryResponseKind::AccessKey(ak) => ak.nonce + 1,
+            _ => anyhow::bail!("Unexpected access key response"),
+        };
+        let block_hash = resp.block_hash;
 
-    // Parse tx hash from output
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_tx_hash(&stdout)
+        let tx = TransactionV0 {
+            signer_id: signer_account_id,
+            public_key,
+            nonce,
+            receiver_id,
+            block_hash,
+            actions: vec![Action::Transfer(TransferAction { deposit: amount_yocto })],
+        };
+        let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer));
+        let tx_hash = format!("{:?}", signed_tx.get_hash());
+        eprintln!("   TX: {}", tx_hash);
+
+        client.call(methods::send_tx::RpcSendTransactionRequest {
+            signed_transaction: signed_tx,
+            wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
+        }).await.map_err(|e| anyhow::anyhow!("send_tx failed: {}", e))?;
+
+        Ok(tx_hash)
+    })
 }
 
-/// Parse transaction hash from near CLI output
-fn parse_tx_hash(output: &str) -> Result<String> {
-    // Look for "Transaction Id: <hash>" or similar patterns
-    for line in output.lines() {
-        if line.contains("Transaction Id:") || line.contains("tx hash:") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            for (i, part) in parts.iter().enumerate() {
-                if *part == "Id:" || *part == "hash:" {
-                    if let Some(hash) = parts.get(i + 1) {
-                        return Ok(hash.trim_end_matches(',').to_string());
-                    }
-                }
-            }
-        }
-        // Also try to match a hash directly
-        for part in line.split_whitespace() {
-            if part.len() == 44 && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                return Ok(part.to_string());
+/// Pay via NEAR Intents (ft_transfer_call) or fall back to plain NEAR
+fn pay_intents(from: &str, to: &str, amount: &str, token_contract: &str, rpc_url: &str) -> Result<String> {
+    use near_primitives::transaction::{Transaction, TransactionV0, Action, FunctionCallAction};
+    use near_primitives::types::AccountId;
+
+    if token_contract == "NEAR" || token_contract.is_empty() {
+        return pay_near(from, to, amount, rpc_url);
+    }
+
+    let signer_account_id: AccountId = from.parse().context("Invalid signer")?;
+    let token_id: AccountId = token_contract.parse().context("Invalid token contract")?;
+    let amount_near: f64 = amount.parse().context("Invalid amount")?;
+    let amount_raw = (amount_near * 1e24) as u128;
+
+    let secret_key = load_signer_key(from)?;
+    let signer = InMemorySigner::from_secret_key(signer_account_id.clone(), secret_key);
+    let public_key = signer.public_key.clone();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = JsonRpcClient::connect(rpc_url);
+
+        let query = methods::query::RpcQueryRequest {
+            block_reference: near_primitives::types::BlockReference::latest(),
+            request: near_primitives::views::QueryRequest::ViewAccessKey {
+                account_id: signer_account_id.clone(),
+                public_key: public_key.clone(),
+            },
+        };
+        let resp = client.call(query).await.context("Failed to get access key")?;
+        let nonce = match resp.kind {
+            near_jsonrpc_primitives::types::query::QueryResponseKind::AccessKey(ak) => ak.nonce + 1,
+            _ => anyhow::bail!("Unexpected access key response"),
+        };
+        let block_hash = resp.block_hash;
+
+        let msg = serde_json::json!({
+            "receiver_id": to,
+            "amount": amount_raw.to_string(),
+            "msg": ""
+        });
+        let args = serde_json::to_vec(&msg).unwrap_or_default();
+
+        let tx = TransactionV0 {
+            signer_id: signer_account_id,
+            public_key,
+            nonce,
+            receiver_id: token_id,
+            block_hash,
+            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                method_name: "ft_transfer_call".to_string(),
+                args,
+                gas: 50_000_000_000_000,
+                deposit: 1,
+            }))],
+        };
+        let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer));
+        let tx_hash = format!("{:?}", signed_tx.get_hash());
+        eprintln!("   TX: {}", tx_hash);
+
+        client.call(methods::send_tx::RpcSendTransactionRequest {
+            signed_transaction: signed_tx,
+            wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
+        }).await.map_err(|e| anyhow::anyhow!("send_tx failed: {}", e))?;
+
+        Ok(tx_hash)
+    })
+}
+
+/// Load signer secret key from near-cli keychain
+fn load_signer_key(account_id: &str) -> Result<near_crypto::SecretKey> {
+    let home = dirs::home_dir().context("No home directory")?;
+    let network = if account_id.contains("testnet") { "testnet" } else { "mainnet" };
+
+    for dir in &[".near-credentials", ".near/credentials", ".near"] {
+        let key_path = home.join(dir).join(network).join(format!("{}.json", account_id));
+        if key_path.exists() {
+            let data = std::fs::read_to_string(&key_path)?;
+            let key_json: serde_json::Value = serde_json::from_str(&data)?;
+            if let Some(pk) = key_json["private_key"].as_str() {
+                let sk: near_crypto::SecretKey = pk.parse()
+                    .map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
+                return Ok(sk);
             }
         }
     }
-    anyhow::bail!("Could not parse transaction hash from output: {}", output)
+    anyhow::bail!("No key found for {} in ~/.near-credentials/", account_id)
 }
 
-/// Print execution result
 fn print_execute_result(result: &ExecuteResponse) {
     println!("{}", "=".repeat(60));
     println!("✅ Success: {}", result.success);
