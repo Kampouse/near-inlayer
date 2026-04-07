@@ -1,6 +1,6 @@
 ---
 name: near-inlayer
-description: Run WASI WASM programs offchain on NEAR. Use when deploying or running offchain workers, executing WASM locally, submitting jobs to a NEAR job-queue contract, or managing an inlayer daemon that polls and resolves executions on-chain.
+description: Run WASI WASM programs offchain on NEAR with MPP-402 payment support. Use when deploying or running offchain workers, executing WASM locally, submitting jobs to a NEAR job-queue contract, managing an inlayer daemon, or handling per-execution payments via NEAR Intents.
 license: MIT
 compatibility: Requires Rust, cargo-near, wasmtime, NEAR CLI, and access to NEAR RPC (testnet/mainnet)
 metadata:
@@ -120,13 +120,20 @@ max_per_day = "1.0"
 - `INLAYER_CONTRACT` — contract account ID
 - `NEAR_PRIVATE_KEY` — signer key
 
-## Payment Flow (Remote Exec)
+## Payment
 
+### NEAR Pricing (contract-level)
+Contract charges per execution: base_fee + per instruction + per ms + per compile ms. Excess refunded on resolve.
+
+### MPP-402 (remote exec API)
+The daemon's HTTP API uses MPP-402 protocol for per-execution payment:
 1. `exec` sends request to worker API
-2. Worker returns 402 with payment challenge
+2. Worker returns 402 with payment challenge (amount, recipient, challenge_id)
 3. Client pays via NEAR Intents
 4. Client retries with payment receipt
 5. Worker verifies on-chain, executes WASM, returns result
+
+Note: WASM host functions for payment (`refund_usd()`) are not included in standalone. NEAR pricing only.
 
 ## Examples
 
@@ -145,4 +152,4 @@ inlayer run target/wasm32-wasip2/release/rpc-test-ark.wasm '{"action":"view_acco
 
 ## What This Does NOT Include (vs full OutLayer)
 
-No TEE/keystore/attestation, no project registry/versioning, no wallet host functions, no VRF host functions, no MPP-402 payment. Simple NEAR-only pricing. Contract is ~650 lines vs ~6100. Worker is ~15k lines vs ~23k.
+No TEE/keystore/attestation, no project registry/versioning, no wallet host functions, no VRF host functions, no WASM payment host functions. Simple NEAR-only pricing (MPP-402 for remote API, NEAR fees for contract). Contract is ~650 lines vs ~6100. Worker is ~15k lines vs ~23k.
