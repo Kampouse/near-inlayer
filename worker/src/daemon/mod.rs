@@ -710,7 +710,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
     let mut consecutive_errors = 0u32;
     let mut last_rpc_poll = std::time::Instant::now();
-    let min_rpc_interval = Duration::from_secs(daemon_cfg.poll_interval_secs.max(60));
+    let min_rpc_interval = Duration::from_secs(daemon_cfg.poll_interval_secs.max(5));
 
     loop {
         let watcher_height = match block_rx.recv_timeout(min_rpc_interval) {
