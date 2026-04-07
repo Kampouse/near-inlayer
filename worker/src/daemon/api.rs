@@ -18,6 +18,7 @@ use axum::{
 use base64::Engine;
 use near_crypto::Signer;
 use near_jsonrpc_client::{methods, JsonRpcClient};
+use serde_json::json;
 use near_primitives::action::{Action, FunctionCallAction};
 use near_primitives::transaction::{Transaction, TransactionV0};
 use serde::Serialize;
@@ -261,12 +262,27 @@ pub(crate) async fn api_execute(
 
     let expected_signer = signer_account.unwrap_or_default();
 
+    // Decode receipt: try base64 JSON first, fallback to raw tx hash
+    let (tx_hash, decoded_signer) = match base64::engine::general_purpose::STANDARD.decode(&receipt) {
+        Ok(bytes) => {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                let hash = json["tx_hash"].as_str().unwrap_or(&receipt).to_string();
+                let signer = json["signer_account"].as_str().unwrap_or("").to_string();
+                (hash, signer)
+            } else {
+                (receipt.clone(), String::new())
+            }
+        }
+        Err(_) => (receipt.clone(), String::new()),
+    };
+    let effective_signer = if expected_signer.is_empty() { decoded_signer } else { expected_signer };
+
     // Step 4: Verify payment on-chain via RPC
     let rpc_url = state.rpc_url.clone();
     let contract_id = state.contract_id.clone();
-    let receipt_for_spawn = receipt.clone();
+    let tx_hash_clone = tx_hash.clone();
     let verification = tokio::task::spawn_blocking(move || {
-        verify_payment(&receipt_for_spawn, &expected_signer, &rpc_url, &contract_id)
+        verify_payment(&tx_hash_clone, &effective_signer, &rpc_url, &contract_id)
     }).await;
 
     let verify_err = match verification {
@@ -377,6 +393,7 @@ pub(crate) async fn api_execute(
         }
 
         Ok(serde_json::json!({
+            "success": wasm_result.success,
             "status": if wasm_result.success { "completed" } else { "failed" },
             "output": if wasm_result.success { serde_json::from_str::<serde_json::Value>(&wasm_result.output).unwrap_or_else(|_| serde_json::json!(wasm_result.output)) } else { serde_json::Value::Null },
             "error": wasm_result.error,

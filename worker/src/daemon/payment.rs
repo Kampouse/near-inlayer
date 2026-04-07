@@ -96,7 +96,7 @@ pub(crate) fn verify_payment(receipt: &str, expected_signer: &str, rpc_url: &str
             "jsonrpc": "2.0",
             "id": "1",
             "method": "EXPERIMENTAL_tx_status",
-            "params": [receipt, contract_id]
+            "params": [receipt, expected_signer]
         }))
         .send()
         .map_err(|e| format!("RPC request failed: {}", e))?;
@@ -110,74 +110,76 @@ pub(crate) fn verify_payment(receipt: &str, expected_signer: &str, rpc_url: &str
 
     let result = body.get("result").cloned().unwrap_or_default();
 
-    // Check transaction status
-    let status = result.get("status").cloned().unwrap_or_default();
-    if status.get("Failure").is_some() {
-        return Err("Transaction failed on-chain".to_string());
-    }
+    // Check final execution status
+    let final_status = result.get("final_execution_status").and_then(|s| s.as_str()).unwrap_or("");
+    if final_status == "FINAL" || final_status.contains("Success") {
+        // Check transaction details
+        let tx = result.get("transaction").cloned().unwrap_or_default();
 
-    let tx = result.get("transaction").cloned().unwrap_or_default();
+        // Verify receiver matches contract
+        let receiver_id = tx.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
+        if receiver_id != contract_id {
+            return Err(format!("Wrong recipient: expected {}, got {}", contract_id, receiver_id));
+        }
 
-    // Verify receiver_id matches our contract
-    let receiver_id = tx.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
-    if receiver_id != contract_id {
-        return Err(format!("Wrong recipient: expected {}, got {}", contract_id, receiver_id));
-    }
+        // Verify signer
+        if expected_signer.is_empty() {
+            return Err("Missing Signer-Account header".to_string());
+        }
+        let tx_signer = tx.get("signer_id").and_then(|s| s.as_str()).unwrap_or("");
+        if tx_signer != expected_signer {
+            return Err(format!("Signer mismatch: expected {}, got {}", expected_signer, tx_signer));
+        }
 
-    // Verify signer_id matches the requester
-    if expected_signer.is_empty() {
-        return Err("Missing Signer-Account header".to_string());
-    }
-    let tx_signer = tx.get("signer_id").and_then(|s| s.as_str()).unwrap_or("");
-    if tx_signer != expected_signer {
-        return Err(format!("Signer mismatch: expected {}, got {}", expected_signer, tx_signer));
-    }
-
-    // Check actions for qualifying payment
-    let actions = tx.get("actions").cloned().unwrap_or_default();
-    if let Some(actions_arr) = actions.as_array() {
-        for action in actions_arr {
-            // Direct NEAR transfer
-            if let Some(transfer) = action.get("Transfer") {
-                let deposit_str = transfer.get("deposit").and_then(|d| d.as_str()).unwrap_or("0");
-                let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
-                let deposit_near = deposit_yocto as f64 / 1e24;
-                if deposit_near >= 0.001 {
-                    return Ok(());
-                }
-            }
-            // FunctionCall (ft_transfer, request_execution, etc.)
-            if let Some(fc) = action.get("FunctionCall") {
-                let method = fc.get("method_name").and_then(|m| m.as_str()).unwrap_or("");
-                let args_b64 = fc.get("args").and_then(|a| a.as_str()).unwrap_or("");
-                let args_bytes = base64::engine::general_purpose::STANDARD.decode(args_b64).unwrap_or_default();
-                let args_json: serde_json::Value = serde_json::from_slice(&args_bytes).unwrap_or_default();
-
-                if method == "ft_transfer_call" || method == "ft_transfer" {
-                    let fc_receiver = args_json.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
-                    if fc_receiver != contract_id {
-                        return Err(format!("Wrong ft_transfer recipient: expected {}, got {}", contract_id, fc_receiver));
-                    }
-                    let amount_str = args_json.get("amount").and_then(|a| a.as_str()).unwrap_or("0");
-                    let amount: f64 = amount_str.parse().unwrap_or(0.0);
-                    if amount > 0.0 {
-                        return Ok(());
-                    }
-                }
-                if method == "request_execution" {
-                    let deposit_str = action.get("deposit").and_then(|d| d.as_str())
-                        .or_else(|| fc.get("deposit").and_then(|d| d.as_str())).unwrap_or("0");
+        // Check actions for qualifying payment
+        let actions = tx.get("actions").cloned().unwrap_or_default();
+        if let Some(actions_arr) = actions.as_array() {
+            for action in actions_arr {
+                if let Some(transfer) = action.get("Transfer") {
+                    let deposit_str = transfer.get("deposit").and_then(|d| d.as_str()).unwrap_or("0");
                     let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
                     let deposit_near = deposit_yocto as f64 / 1e24;
                     if deposit_near >= 0.001 {
                         return Ok(());
                     }
                 }
+                if let Some(fc) = action.get("FunctionCall") {
+                    let method = fc.get("method_name").and_then(|m| m.as_str()).unwrap_or("");
+                    let args_b64 = fc.get("args").and_then(|a| a.as_str()).unwrap_or("");
+                    let args_bytes = base64::engine::general_purpose::STANDARD.decode(args_b64).unwrap_or_default();
+                    let args_json: serde_json::Value = serde_json::from_slice(&args_bytes).unwrap_or_default();
+
+                    if method == "ft_transfer_call" || method == "ft_transfer" {
+                        let fc_receiver = args_json.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
+                        if fc_receiver != contract_id {
+                            return Err(format!("Wrong ft_transfer recipient: expected {}, got {}", contract_id, fc_receiver));
+                        }
+                        let amount_str = args_json.get("amount").and_then(|a| a.as_str()).unwrap_or("0");
+                        let amount: f64 = amount_str.parse().unwrap_or(0.0);
+                        if amount > 0.0 {
+                            return Ok(());
+                        }
+                    }
+                    if method == "request_execution" {
+                        let deposit_str = fc.get("deposit").and_then(|d| d.as_str()).unwrap_or("0");
+                        let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
+                        let deposit_near = deposit_yocto as f64 / 1e24;
+                        if deposit_near >= 0.001 {
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
+
+        return Err("No valid payment action found in transaction".to_string());
     }
 
-    Err("No valid payment action found in transaction".to_string())
+    if final_status.contains("Failure") {
+        return Err("Transaction failed on-chain".to_string());
+    }
+
+    Err(format!("Unexpected TX status: {}", final_status))
 }
 
 /// Mark a payment receipt as used (persisted to disk for replay prevention).
