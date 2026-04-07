@@ -1,3 +1,0 @@
-docker build -t zavodil/wasmedge-compiler:latest -f docker/Dockerfile.wasmedge-compiler .
-
-docker push zavodil/wasmedge-compiler:latest
