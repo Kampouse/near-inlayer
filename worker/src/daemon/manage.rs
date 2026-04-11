@@ -10,6 +10,31 @@ use anyhow::{bail, Context, Result};
 use near_crypto::InMemorySigner;
 use serde::{Deserialize, Serialize};
 
+/// Deserialize a u128 from TOML. TOML 0.8 only supports i64 integers,
+/// so we accept both integer (for small values) and string (for large yoctoNEAR amounts).
+fn deserialize_yocto<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct YoctoVisitor;
+    impl<'de> Visitor<'de> for YoctoVisitor {
+        type Value = u128;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an integer or string representing a u128 yoctoNEAR amount")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u128, E> {
+            Ok(v as u128)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u128, E> {
+            Ok(v as u128)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u128, E> {
+            v.parse::<u128>().map_err(de::Error::custom)
+        }
+    }
+    deserializer.deserialize_any(YoctoVisitor)
+}
+
 /// Daemon configuration fields (merged into inlayer Config).
 /// These are daemon-specific settings that complement the base inlayer Config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -26,7 +51,13 @@ pub struct DaemonConfig {
     /// Cloudflare tunnel URL (auto-populated when using --tunnel)
     pub tunnel_url: Option<String>,
     /// Deposit for request_execution in yoctoNEAR (default: 7.001 NEAR)
+    /// Config accepts string to handle large u128 values beyond TOML i64 limits.
+    #[serde(deserialize_with = "deserialize_yocto")]
     pub deposit_yocto: u128,
+    /// Nostr relay URL for agent coordination (e.g. "wss://nostr-relay.example.com")
+    pub nostr_relay: Option<String>,
+    /// Nostr nsec (hex, 64 chars) for signing coordination events
+    pub nostr_nsec: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -42,6 +73,8 @@ impl Default for DaemonConfig {
             search_paths: vec!["./wasi-examples".to_string()],
             tunnel_url: None,
             deposit_yocto: 7_001_000_000_000_000_000_000u128, // 7.001 NEAR
+            nostr_relay: None,
+            nostr_nsec: None,
         }
     }
 }
@@ -124,6 +157,8 @@ impl DaemonConfig {
                         cfg.expand_tildes();
                         tracing::info!("📁 Using config from: {}", path.display());
                         return cfg;
+                    } else {
+                        eprintln!("WARN: TOML parse failed for {}", path.display());
                     }
                 }
             }

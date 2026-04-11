@@ -13,7 +13,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use base64::Engine;
-use near_crypto::InMemorySigner;
+use near_crypto::{InMemorySigner, Signer};
+use near_jsonrpc_client::{methods, JsonRpcClient};
+use near_primitives::action::{Action, FunctionCallAction};
+use near_primitives::transaction::{Transaction, TransactionV0};
+use near_primitives::views::ExecutionStatusView;
 use serde::Serialize;
 use sha2::Digest;
 use std::sync::OnceLock;
@@ -33,6 +37,7 @@ mod payment;
 mod rpc_pool;
 mod tunnel;
 mod watcher;
+mod nostr;
 
 pub use manage::{DaemonConfig, load_signer};
 
@@ -538,6 +543,331 @@ pub(crate) fn get_pending_ids(rpc: &rpc_pool::Rpc, contract: &str) -> anyhow::Re
 }
 
 
+// ── Nostr event handlers ────────────────────────────────────────────────
+
+/// Dispatch incoming Nostr events to the appropriate handler.
+fn handle_nostr_event(
+    event: &nostr::NostrEvent,
+    daemon_cfg: &DaemonConfig,
+    signer: &InMemorySigner,
+    nonce_cache: &nonce::NonceCache,
+    rpc_url: &str,
+    log: &mut dyn FnMut(&str),
+) {
+    match event.kind {
+        nostr::KIND_DISPATCH => {
+            log(&format!(" nostr DISPATCH from {}...", &event.pubkey[..8.min(event.pubkey.len())]));
+            handle_nostr_dispatch(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
+        }
+        nostr::KIND_RESULT => {
+            log(&format!(" nostr RESULT from {}...", &event.pubkey[..8.min(event.pubkey.len())]));
+            handle_nostr_result(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
+        }
+        nostr::KIND_CLAIM => {
+            log(&format!(" nostr CLAIM from {}...", &event.pubkey[..8.min(event.pubkey.len())]));
+            handle_nostr_claim(event, daemon_cfg, log);
+        }
+        _ => {
+            log(&format!(" nostr unhandled kind {}", event.kind));
+        }
+    }
+}
+
+/// Kind 7201 — Hermes A dispatched a task.
+///
+/// Flow: parse content → call request_execution() on contract → publish kind 7202 (job available).
+fn handle_nostr_dispatch(
+    event: &nostr::NostrEvent,
+    daemon_cfg: &DaemonConfig,
+    signer: &InMemorySigner,
+    nonce_cache: &nonce::NonceCache,
+    rpc_url: &str,
+    log: &mut dyn FnMut(&str),
+) {
+    // Parse event content
+    let content: serde_json::Value = match serde_json::from_str(&event.content) {
+        Ok(v) => v,
+        Err(e) => {
+            log(&format!("   dispatch: invalid JSON — {}", e));
+            return;
+        }
+    };
+
+    let input = content.get("input").and_then(|v| v.as_str()).unwrap_or("");
+    let wasm_url = content.get("wasm_url").and_then(|v| v.as_str()).unwrap_or("local");
+    let max_instructions = content.get("max_instructions").and_then(|v| v.as_u64()).unwrap_or(10_000_000_000);
+    let max_memory_mb = content.get("max_memory_mb").and_then(|v| v.as_u64()).unwrap_or(256) as u32;
+
+    // Build request_execution args
+    let input_b64 = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
+    let args = serde_json::json!({
+        "source": {"WasmUrl": {"url": wasm_url, "hash": "0".repeat(64)}},
+        "input_data": input_b64,
+        "resource_limits": {
+            "max_instructions": max_instructions,
+            "max_memory_mb": max_memory_mb,
+            "max_execution_seconds": 300u64
+        },
+        "secrets_ref": null,
+        "response_format": null,
+        "payer_account_id": null,
+        "params": null
+    });
+
+    // Send transaction to contract
+    match send_function_call(
+        rpc_url, signer, &daemon_cfg.contract_id,
+        "request_execution", &args,
+        300_000_000_000_000, // 300 Tgas
+        daemon_cfg.deposit_yocto,
+        nonce_cache,
+    ) {
+        Ok((tx_hash, return_value)) => {
+            log(&format!("   request_execution tx={}", tx_hash));
+
+            // Extract request_id from return value
+            let request_id = return_value
+                .as_ref()
+                .and_then(|v| v.as_u64())
+                .or_else(|| return_value.as_ref().and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+                .unwrap_or(0);
+
+            log(&format!("   job_id={} creator={}", request_id, &event.pubkey[..16.min(event.pubkey.len())]));
+
+            // Publish kind 7202 (job available) to Nostr
+            if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
+                let response = serde_json::json!({
+                    "job_id": request_id,
+                    "creator": event.pubkey,
+                    "status": "pending",
+                    "tx_hash": tx_hash,
+                    "wasm_url": wasm_url,
+                });
+                let content_str = serde_json::to_string(&response).unwrap_or_default();
+                let tags = vec![vec!["e".into(), event.id.clone()], vec!["p".into(), event.pubkey.clone()]];
+                match nostr::publish_event(relay, nsec, nostr::KIND_JOB_AVAILABLE, &content_str, tags) {
+                    Ok(()) => log("   published kind 7202 (job available) ✓"),
+                    Err(e) => log(&format!("   failed to publish 7202: {}", e)),
+                }
+            } else {
+                log("   (nostr_relay or nostr_nsec not configured — skipping 7202 publish)");
+            }
+        }
+        Err(e) => {
+            log(&format!("   request_execution FAILED: {}", e));
+            nonce_cache.invalidate();
+        }
+    }
+}
+
+/// Kind 7203 — Hermes B submitted a result.
+///
+/// Flow: parse content → call resolve_execution() on contract → publish kind 7205 (confirmed).
+fn handle_nostr_result(
+    event: &nostr::NostrEvent,
+    daemon_cfg: &DaemonConfig,
+    signer: &InMemorySigner,
+    nonce_cache: &nonce::NonceCache,
+    rpc_url: &str,
+    log: &mut dyn FnMut(&str),
+) {
+    let content: serde_json::Value = match serde_json::from_str(&event.content) {
+        Ok(v) => v,
+        Err(e) => {
+            log(&format!("   result: invalid JSON — {}", e));
+            return;
+        }
+    };
+
+    let job_id = match content.get("job_id").and_then(|v| v.as_u64()) {
+        Some(id) => id,
+        None => {
+            log("   result: missing job_id");
+            return;
+        }
+    };
+
+    let result_output = content.get("result").and_then(|v| v.as_str()).unwrap_or("");
+    let success = content.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+    let instructions = content.get("instructions").and_then(|v| v.as_u64()).unwrap_or(0);
+    let time_ms = content.get("time_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // Build resolve_execution args (same format as nonce::resolve_one)
+    let args = serde_json::json!({
+        "request_id": job_id,
+        "response": {
+            "success": success,
+            "output": {"Text": result_output},
+            "error": if success { serde_json::Value::Null } else { serde_json::Value::String("Agent reported failure".into()) },
+            "resources_used": {"instructions": instructions, "time_ms": time_ms},
+            "compilation_note": null,
+            "refund_usd": null,
+        }
+    });
+
+    match send_function_call(
+        rpc_url, signer, &daemon_cfg.contract_id,
+        "resolve_execution", &args,
+        100_000_000_000_000, // 100 Tgas
+        0, // no deposit for resolve
+        nonce_cache,
+    ) {
+        Ok((tx_hash, _return_value)) => {
+            log(&format!("   resolve_execution job={} tx={}", job_id, tx_hash));
+
+            // Publish kind 7205 (confirmed on-chain)
+            if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
+                let response = serde_json::json!({
+                    "job_id": job_id,
+                    "worker": event.pubkey,
+                    "status": "on-chain",
+                    "tx_hash": tx_hash,
+                    "success": success,
+                });
+                let content_str = serde_json::to_string(&response).unwrap_or_default();
+                let tags = vec![vec!["e".into(), event.id.clone()], vec!["p".into(), event.pubkey.clone()]];
+                match nostr::publish_event(relay, nsec, nostr::KIND_CONFIRMED, &content_str, tags) {
+                    Ok(()) => log("   published kind 7205 (confirmed) ✓"),
+                    Err(e) => log(&format!("   failed to publish 7205: {}", e)),
+                }
+            }
+        }
+        Err(e) => {
+            log(&format!("   resolve_execution FAILED for job={}: {}", job_id, e));
+            nonce_cache.invalidate();
+        }
+    }
+}
+
+/// Kind 7204 — Hermes B claims a job.
+///
+/// Flow: parse content → log claim → publish kind 7202 update.
+/// (Contract claim handling depends on contract API — logging for now.)
+fn handle_nostr_claim(
+    event: &nostr::NostrEvent,
+    daemon_cfg: &DaemonConfig,
+    log: &mut dyn FnMut(&str),
+) {
+    let content: serde_json::Value = match serde_json::from_str(&event.content) {
+        Ok(v) => v,
+        Err(e) => {
+            log(&format!("   claim: invalid JSON — {}", e));
+            return;
+        }
+    };
+
+    let job_id = content.get("job_id").and_then(|v| v.as_u64()).unwrap_or(0);
+    log(&format!("   job={} claimed by {}", job_id, &event.pubkey[..16.min(event.pubkey.len())]));
+
+    // Publish kind 7202 update (claimed status)
+    if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
+        let response = serde_json::json!({
+            "job_id": job_id,
+            "worker": event.pubkey,
+            "status": "claimed",
+        });
+        let content_str = serde_json::to_string(&response).unwrap_or_default();
+        let tags = vec![vec!["e".into(), event.id.clone()], vec!["p".into(), event.pubkey.clone()]];
+        match nostr::publish_event(relay, nsec, nostr::KIND_JOB_AVAILABLE, &content_str, tags) {
+            Ok(()) => log("   published kind 7202 update (claimed) ✓"),
+            Err(e) => log(&format!("   failed to publish 7202 update: {}", e)),
+        }
+    }
+}
+
+/// Generic function call to a NEAR contract.
+///
+/// Uses broadcast_tx_commit (waits for finalization) and extracts the return value.
+/// Returns (tx_hash, Option<return_value>).
+fn send_function_call(
+    rpc_url: &str,
+    signer: &InMemorySigner,
+    contract_id: &str,
+    method: &str,
+    args: &serde_json::Value,
+    gas: u64,
+    deposit: u128,
+    nonce_cache: &nonce::NonceCache,
+) -> anyhow::Result<(String, Option<serde_json::Value>)> {
+    let (nonce_val, block_hash) = nonce_cache
+        .reserve_batch(1)
+        .map_err(|e| {
+            nonce_cache.invalidate();
+            e
+        })?;
+
+    let client = JsonRpcClient::connect(rpc_url);
+    let rt = tokio::runtime::Runtime::new()?;
+    let contract: near_primitives::types::AccountId = contract_id.parse()?;
+
+    rt.block_on(async {
+        let tx = TransactionV0 {
+            signer_id: signer.account_id.clone(),
+            public_key: signer.public_key.clone(),
+            nonce: nonce_val,
+            receiver_id: contract,
+            block_hash,
+            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                method_name: method.to_string(),
+                args: serde_json::to_vec(args)?,
+                gas,
+                deposit,
+            }))],
+        };
+        let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
+        let tx_hash = format!("{:?}", signed_tx.get_hash());
+
+        let outcome = client
+            .call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+                signed_transaction: signed_tx,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{} failed: {}", method, e))?;
+
+        let return_value = extract_return_value(&outcome);
+
+        Ok((tx_hash, return_value))
+    })
+}
+
+/// Extract return value from a FinalExecutionOutcomeView.
+/// Checks all receipt outcomes for SuccessValue.
+fn extract_return_value(
+    outcome: &near_primitives::views::FinalExecutionOutcomeView,
+) -> Option<serde_json::Value> {
+    // Check receipt outcomes first (where function call results appear)
+    for receipt in &outcome.receipts_outcome {
+        if let ExecutionStatusView::SuccessValue(bytes) = &receipt.outcome.status {
+            if let Ok(s) = String::from_utf8(bytes.clone()) {
+                // Try JSON
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    return Some(v);
+                }
+                // Try as plain number (e.g., request_id)
+                if let Ok(n) = s.trim().parse::<u64>() {
+                    return Some(serde_json::json!(n));
+                }
+                return Some(serde_json::json!(s));
+            }
+            // Try borsh-encoded u64 (8 bytes LE)
+            if bytes.len() == 8 {
+                let n = u64::from_le_bytes(bytes.clone().try_into().ok()?);
+                return Some(serde_json::json!(n));
+            }
+        }
+    }
+    // Fallback: check top-level status
+    if let near_primitives::views::FinalExecutionStatus::SuccessValue(bytes) = &outcome.status {
+        if let Ok(s) = String::from_utf8(bytes.clone()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+
 
 // ── Main entry point ────────────────────────────────────────────────────────
 
@@ -708,11 +1038,30 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     let block_rx = watcher::spawn_block_watcher(&daemon_cfg.network, &rpc_url, daemon_cfg.poll_interval_secs);
     log("Block watcher started (neardata.xyz event-driven polling)");
 
+    // ── Nostr subscriber ───────────────────────────────────────────────
+    let nostr_rx = daemon_cfg.nostr_relay.as_ref().map(|relay| {
+        let rx = nostr::spawn_nostr_subscriber(relay);
+        log(&format!("Nostr subscriber started ({})", relay));
+        if let Some(ref nsec) = daemon_cfg.nostr_nsec {
+            if let Ok(npub) = nostr::npub_from_nsec(nsec) {
+                log(&format!("Nostr identity: npub1{}...", &npub[..8.min(npub.len())]));
+            }
+        }
+        rx
+    });
+
     let mut consecutive_errors = 0u32;
     let mut last_rpc_poll = std::time::Instant::now();
     let min_rpc_interval = Duration::from_secs(daemon_cfg.poll_interval_secs.max(5));
 
     loop {
+        // ── Process Nostr events (non-blocking) ───────────────────────
+        if let Some(ref rx) = nostr_rx {
+            while let Ok(event) = rx.try_recv() {
+                handle_nostr_event(&event, &daemon_cfg, &signer, &nonce_cache, &rpc_url, &mut log);
+            }
+        }
+
         let watcher_height = match block_rx.recv_timeout(min_rpc_interval) {
             Ok(h) => h,
             Err(_) => 0,
