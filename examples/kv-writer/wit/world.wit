@@ -1,0 +1,14 @@
+package near:rpc@0.1.0;
+
+interface api {
+    /// Call a contract method with explicit signer
+    call: func(signer-id: string, signer-key: string, receiver-id: string, method-name: string, args-json: string, deposit-yocto: string, gas: string, wait-until: string) -> tuple<string, string>;
+    /// Call a view function on a smart contract
+    view: func(contract-id: string, method-name: string, args-json: string, finality-or-block: string) -> tuple<string, string>;
+    /// Get block info
+    block: func(finality-or-block: string) -> tuple<string, string>;
+}
+
+world kv-writer {
+    import api;
+}

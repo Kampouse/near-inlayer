@@ -1,0 +1,20 @@
+[package]
+name = "kv-writer-ark"
+version = "0.1.0"
+edition = "2021"
+description = "Write key-value pairs to NEAR FastData KV via OutLayer"
+
+[[bin]]
+name = "kv-writer-ark"
+path = "src/main.rs"
+
+[dependencies]
+wit-bindgen = "0.36"
+outlayer = { path = "../../../near-outlayer/sdk/outlayer" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
