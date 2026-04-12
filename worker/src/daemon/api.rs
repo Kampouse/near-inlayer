@@ -18,7 +18,6 @@ use axum::{
 use base64::Engine;
 use near_crypto::Signer;
 use near_jsonrpc_client::{methods, JsonRpcClient};
-use serde_json::json;
 use near_primitives::action::{Action, FunctionCallAction};
 use near_primitives::transaction::{Transaction, TransactionV0};
 use serde::Serialize;
@@ -549,7 +548,7 @@ pub(crate) async fn api_call(
 /// GET /wasm/:owner/:project - Serve WASM files for project registration.
 pub(crate) async fn api_wasm(
     State(state): State<Arc<DashboardState>>,
-    Path((owner, project)): Path<(String, String)>,
+    Path((_owner, project)): Path<(String, String)>,
 ) -> (StatusCode, Body) {
     let search_paths = state.search_paths.clone();
 

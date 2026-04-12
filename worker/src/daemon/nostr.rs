@@ -232,7 +232,7 @@ pub fn build_signed_event(
 
     // SHA256 → event id
     let hash = sha2::Sha256::digest(canonical.as_bytes());
-    let event_id = hex::encode(&hash);
+    let event_id = hex::encode(hash);
 
     // Schnorr sign (BIP-340)
     let msg = secp256k1::Message::from_digest(hash.into());

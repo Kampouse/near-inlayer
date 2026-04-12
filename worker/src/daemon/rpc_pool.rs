@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use base64::Engine;
 
-use super::{ParsedSource, RequestInfo, parse_source};
+use super::{RequestInfo, parse_source};
 
 /// Single RPC endpoint with failure tracking.
 pub(crate) struct RpcEndpoint {

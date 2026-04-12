@@ -165,7 +165,7 @@ impl RpcProxy {
     ///
     /// # Arguments
     /// * `chunk_id` - Chunk hash
-    /// OR
+    ///   OR
     /// * `block_id` - Block height/hash
     /// * `shard_id` - Shard ID
     #[allow(dead_code)]

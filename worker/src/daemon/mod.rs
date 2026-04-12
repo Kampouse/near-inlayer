@@ -4,6 +4,7 @@
 //! Exposed as `inlayer daemon [--start|--stop|--status|--log|--daemon|--foreground|--dashboard <addr>]`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -178,6 +179,114 @@ fn inject_signer(input: &mut serde_json::Value, signer: &InMemorySigner) {
     }
 }
 
+// ── Phase 1 Security: Input Validation ──────────────────────────────────
+
+/// Patterns that must never appear in agent input (secrets/sensitive data).
+const BLOCKED_PATTERNS: &[&str] = &["private_key", "mnemonic", "seed_phrase"];
+
+/// Rate limiter state: tracks job counts per pubkey per hour.
+static RATE_LIMITER: once_cell::sync::Lazy<Mutex<HashMap<String, Vec<u64>>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Validate input JSON for security before WASM execution.
+/// Returns Err(reason) if validation fails.
+fn validate_input(input: &serde_json::Value, config: &DaemonConfig) -> Result<(), String> {
+    // 1. "action" must be present
+    let action = input.get("action").and_then(|v| v.as_str()).ok_or_else(|| "missing required field: action".to_string())?;
+
+    // 2. Action must be whitelisted
+    if !config.allowed_actions.iter().any(|a| a == action) {
+        return Err(format!("action '{}' not allowed (allowed: {:?})", action, config.allowed_actions));
+    }
+
+    // 3. "entries" must be an object if present
+    if let Some(entries) = input.get("entries") {
+        if !entries.is_object() {
+            return Err("field 'entries' must be an object".to_string());
+        }
+        // Enforce max_entries
+        if entries.as_object().map(|o| o.len()).unwrap_or(0) > config.max_entries {
+            return Err(format!("entries count exceeds max_entries ({})", config.max_entries));
+        }
+    }
+
+    // 4. Reject if input already contains signer_key (daemon injects it)
+    if input.get("signer_key").is_some() {
+        return Err("input must not contain 'signer_key' (daemon injects it)".to_string());
+    }
+
+    // 5. Reject blocked patterns anywhere in the JSON string
+    let input_str = serde_json::to_string(input).unwrap_or_default().to_lowercase();
+    for pattern in BLOCKED_PATTERNS {
+        if input_str.contains(pattern) {
+            return Err(format!("input contains blocked pattern: '{}'", pattern));
+        }
+    }
+
+    Ok(())
+}
+
+/// Check rate limit for a pubkey. Returns false if over limit.
+fn check_rate_limit(pubkey: &str, max_per_hour: usize) -> bool {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let hour_ago = now_secs.saturating_sub(3600);
+
+    let mut map = RATE_LIMITER.lock().unwrap();
+    let timestamps = map.entry(pubkey.to_string()).or_default();
+    timestamps.retain(|&t| t > hour_ago);
+    if timestamps.len() >= max_per_hour {
+        return false;
+    }
+    timestamps.push(now_secs);
+    true
+}
+
+/// Validate WASM output. Returns (validated_output, error_if_any).
+fn validate_output(output: &str, max_bytes: usize) -> Result<String, String> {
+    // Enforce max size
+    if output.len() > max_bytes {
+        return Err(format!("output exceeds max_output_bytes ({} > {})", output.len(), max_bytes));
+    }
+
+    // Must be valid JSON with "success" boolean
+    let mut parsed: serde_json::Value = serde_json::from_str(output)
+        .map_err(|e| format!("output is not valid JSON: {}", e))?;
+
+    if parsed.get("success").and_then(|v| v.as_bool()).is_none() {
+        // Not a hard error — some outputs don't have this field. Just log.
+    }
+
+    // Strip any field values matching private key patterns
+    strip_sensitive_values(&mut parsed);
+    Ok(serde_json::to_string(&parsed).unwrap_or_else(|_| output.to_string()))
+}
+
+/// Recursively strip values containing private key patterns from JSON.
+fn strip_sensitive_values(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                strip_sensitive_values(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                strip_sensitive_values(v);
+            }
+        }
+        serde_json::Value::String(s) => {
+            let lower = s.to_lowercase();
+            if BLOCKED_PATTERNS.iter().any(|p| lower.contains(p)) {
+                *s = "[REDACTED]".to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
 fn signer_key_bytes(signer: &InMemorySigner) -> [u8; 32] {
     let sk_str = signer.secret_key.to_string();
     let b64 = sk_str.strip_prefix("ed25519:").unwrap_or(&sk_str);
@@ -339,7 +448,7 @@ fn walk_wasm_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Find WASM by project_id in search paths.
 fn resolve_wasm_from_project(project_id: &str, config: &DaemonConfig) -> Option<Vec<u8>> {
     // Extract project name from "owner/project" or use as-is
-    let project_name = project_id.split('/').last().unwrap_or(project_id);
+    let project_name = project_id.split('/').next_back().unwrap_or(project_id);
 
     for dir in &config.search_paths {
         let base = PathBuf::from(dir);
@@ -429,7 +538,7 @@ pub(crate) fn find_wasm(config: &DaemonConfig) -> Option<PathBuf> {
                 // Direct WASM file
                 if path.is_file() && path.extension().map(|e| e == "wasm").unwrap_or(false) {
                     let size = path.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
-                    let is_better = best.as_ref().map_or(true, |(_, sz)| size < *sz);
+                    let is_better = best.as_ref().is_none_or(|(_, sz)| size < *sz);
                     if is_better {
                         best = Some((path, size));
                     }
@@ -449,7 +558,7 @@ pub(crate) fn find_wasm(config: &DaemonConfig) -> Option<PathBuf> {
                                 // Skip deps and hidden files
                                 if !fname.starts_with('.') && !fname.contains("-deps") {
                                     let size = wasm_path.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
-                                    let is_better = best.as_ref().map_or(true, |(_, sz)| size < *sz);
+                                    let is_better = best.as_ref().is_none_or(|(_, sz)| size < *sz);
                                     if is_better {
                                         best = Some((wasm_path, size));
                                     }
@@ -610,6 +719,23 @@ fn handle_nostr_dispatch(
 ) {
     log("   [7201] handle_nostr_dispatch start");
 
+    // ── Phase 1 Security: Rate limiting ────────────────────────────────
+    if !check_rate_limit(&event.pubkey, daemon_cfg.max_jobs_per_hour) {
+        log(&format!("   RATE LIMITED: {} exceeded {} jobs/hour", &event.pubkey[..8.min(event.pubkey.len())], daemon_cfg.max_jobs_per_hour));
+        // Publish 7203 error result
+        if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
+            let err_content = serde_json::json!({
+                "job_id": 0u64,
+                "success": false,
+                "error": "rate limited: too many jobs",
+                "creator": event.pubkey,
+            });
+            let tags = vec![vec!["e".into(), event.id.clone()], vec!["p".into(), event.pubkey.clone()]];
+            let _ = nostr::publish_event(relay, nsec, nostr::KIND_RESULT, &serde_json::to_string(&err_content).unwrap_or_default(), tags);
+        }
+        return;
+    }
+
     // Parse event content
     let content: serde_json::Value = match serde_json::from_str(&event.content) {
         Ok(v) => v,
@@ -619,18 +745,51 @@ fn handle_nostr_dispatch(
         }
     };
 
-    let mut input = match content.get("input") {
+    // ── Phase 1 Security: Program whitelist ────────────────────────────
+    if let Some(program) = content.get("program").and_then(|v| v.as_str()) {
+        if !daemon_cfg.allowed_programs.iter().any(|p| p == program) {
+            log(&format!("   REJECTED: program '{}' not whitelisted", program));
+            return;
+        }
+    }
+
+    // ── Phase 1 Security: Input validation ─────────────────────────────
+    let mut input_val: serde_json::Value = match content.get("input") {
         Some(v) if v.is_string() => {
-            let mut parsed: serde_json::Value = serde_json::from_str(v.as_str().unwrap_or("")).unwrap_or(serde_json::Value::Object(Default::default()));
-            inject_signer(&mut parsed, signer);
-            serde_json::to_string(&parsed).unwrap_or_default()
+            serde_json::from_str(v.as_str().unwrap_or("{}")).unwrap_or(serde_json::Value::Object(Default::default()))
         }
-        Some(v) => {
-            let mut parsed = v.clone();
-            inject_signer(&mut parsed, signer);
-            serde_json::to_string(&parsed).unwrap_or_default()
+        Some(v) => v.clone(),
+        None => serde_json::Value::Object(Default::default()),
+    };
+
+    if let Err(reason) = validate_input(&input_val, daemon_cfg) {
+        log(&format!("   INPUT REJECTED: {}", reason));
+        // Publish 7203 error result
+        if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
+            let err_content = serde_json::json!({
+                "job_id": 0u64,
+                "success": false,
+                "error": format!("input validation failed: {}", reason),
+                "creator": event.pubkey,
+            });
+            let tags = vec![vec!["e".into(), event.id.clone()], vec!["p".into(), event.pubkey.clone()]];
+            let _ = nostr::publish_event(relay, nsec, nostr::KIND_RESULT, &serde_json::to_string(&err_content).unwrap_or_default(), tags);
         }
-        None => String::new(),
+        return;
+    }
+
+    // ── Phase 1 Security: agent_pays check ─────────────────────────────
+    // When agent_pays=false (default), the operator covers all costs.
+    // deposit=1 yocto and operator account is used for execution — already handled.
+    // If agent_pays=true were enabled, we'd charge the agent's account instead.
+    if daemon_cfg.agent_pays {
+        log("   WARNING: agent_pays=true is not yet implemented; operator still covering costs");
+    }
+
+    let input = {
+        // We already parsed input_val above; inject signer and serialize
+        inject_signer(&mut input_val, signer);
+        serde_json::to_string(&input_val).unwrap_or_default()
     };
     let wasm_url = content.get("wasm_url").and_then(|v| v.as_str()).unwrap_or("local");
     let max_instructions = content.get("max_instructions").and_then(|v| v.as_u64()).unwrap_or(10_000_000_000);
@@ -953,7 +1112,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
     let dashboard_addr = manage::parse_dashboard_flag(args).or(daemon_cfg.dashboard_addr.clone());
     let is_daemon = args.iter().any(|a| a == "--daemon");
-    let is_foreground = args.iter().any(|a| a == "--foreground");
+    let _is_foreground = args.iter().any(|a| a == "--foreground");
     let use_tunnel = args.iter().any(|a| a == "--tunnel");
 
     // Validate configuration before starting daemon
@@ -1103,7 +1262,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     });
 
     let mut consecutive_errors = 0u32;
-    let mut last_rpc_poll = std::time::Instant::now();
+    let last_rpc_poll = std::time::Instant::now();
     let min_rpc_interval = Duration::from_secs(daemon_cfg.poll_interval_secs.max(5));
 
     loop {
@@ -1114,10 +1273,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
             }
         }
 
-        let watcher_height = match block_rx.recv_timeout(min_rpc_interval) {
-            Ok(h) => h,
-            Err(_) => 0,
-        };
+        let watcher_height = block_rx.recv_timeout(min_rpc_interval).unwrap_or_default();
 
         // Rate-limit RPC polling: never hit RPC more than once per min_rpc_interval
         let elapsed = last_rpc_poll.elapsed();
@@ -1199,14 +1355,24 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
                 // Capture everything we need before consuming wasm_results
                 let wasm_captured: Vec<(u64, bool, String, String, u64, u64)> = wasm_results.into_iter().map(|result| {
-                    if result.success {
-                        log(&format!("   #{} | {}ms | {} instr", result.request_id, result.time_ms, result.instructions));
-                        log(&format!("   {}", result.output));
+                    // Phase 1 Security: output validation
+                    let output = if result.success {
+                        match validate_output(&result.output, daemon_cfg.max_output_bytes) {
+                            Ok(validated) => {
+                                log(&format!("   #{} | {}ms | {} instr", result.request_id, result.time_ms, result.instructions));
+                                log(&format!("   {}", &validated[..validated.len().min(200)]));
+                                validated
+                            }
+                            Err(reason) => {
+                                log(&format!("   #{} OUTPUT REJECTED: {}", result.request_id, reason));
+                                format!("{{\"success\":false,\"error\":\"output validation: {}\"}}", reason)
+                            }
+                        }
                     } else {
                         let err = result.error.clone().unwrap_or_default();
                         log(&format!("   #{}: {}", result.request_id, err));
-                    }
-                    let output = if result.success { result.output.clone() } else { result.error.unwrap_or_default() };
+                        err
+                    };
                     (result.request_id, result.success, result.input.clone(), output, result.time_ms, result.instructions)
                 }).collect();
 
@@ -1279,10 +1445,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                             }
                         }
                     }
-                    match tx_result {
-                        Ok(_) => { processed.insert(req_id); },
-                        Err(_) => {},
-                    }
+                    if tx_result.is_ok() { processed.insert(req_id); }
                 }
 
                 if processed.len() > 500 {
@@ -1303,6 +1466,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     }
 
     // Cleanup (unreachable in infinite loop, but here for completeness)
+    #[allow(unreachable_code)]
     tunnel::stop_cloudflare_tunnel();
 
     Ok(())

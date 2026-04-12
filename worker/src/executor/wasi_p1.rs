@@ -74,13 +74,13 @@ pub async fn execute(
     let engine = get_p1_engine();
 
     // Try to load as module
-    let module = wasmtime::Module::from_binary(&engine, wasm_bytes)
+    let module = wasmtime::Module::from_binary(engine, wasm_bytes)
         .context("Not a valid WASI Preview 1 module")?;
 
     debug!("Loaded as WASI Preview 1 module (wasmtime)");
 
     // Create linker for WASI P1
-    let mut linker = wasmtime::Linker::new(&engine);
+    let mut linker = wasmtime::Linker::new(engine);
     preview1::add_to_linker_async(&mut linker, |t: &mut WasiP1Ctx| t)?;
 
     // Prepare stdin/stdout pipes
@@ -106,7 +106,7 @@ pub async fn execute(
     let wasi_p1_ctx = wasi_builder.build_p1();
 
     // Create store with fuel limit
-    let mut store = Store::new(&engine, wasi_p1_ctx);
+    let mut store = Store::new(engine, wasi_p1_ctx);
     store.set_fuel(limits.max_instructions)?;
     let timeout_secs = limits.max_execution_seconds.max(5);
     store.set_epoch_deadline(timeout_secs);

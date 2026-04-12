@@ -9,6 +9,7 @@ use std::env;
 
 /// Client configuration loaded from config file or CLI
 #[derive(Debug, Clone, Deserialize)]
+#[derive(Default)]
 pub struct ClientConfig {
     /// Worker URL (e.g., https://worker.example.com)
     pub worker_url: Option<String>,
@@ -72,7 +73,7 @@ impl ClientConfig {
         if let Some(url) = arg {
             return Ok(url.to_string());
         }
-        if let Some(url) = env::var("OUTLAYER_WORKER_URL").ok() {
+        if let Ok(url) = env::var("OUTLAYER_WORKER_URL") {
             return Ok(url);
         }
         if let Some(ref url) = self.worker_url {
@@ -86,7 +87,7 @@ impl ClientConfig {
         if let Some(id) = arg {
             return Ok(id.to_string());
         }
-        if let Some(id) = env::var("OUTLAYER_ACCOUNT_ID").ok() {
+        if let Ok(id) = env::var("OUTLAYER_ACCOUNT_ID") {
             return Ok(id);
         }
         if let Some(ref id) = self.account_id {
@@ -110,15 +111,6 @@ impl ClientConfig {
     }
 }
 
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            worker_url: None,
-            account_id: None,
-            payment: PaymentConfig::default(),
-        }
-    }
-}
 
 /// Payment challenge returned by worker on 402
 #[derive(Debug, Clone, Deserialize)]

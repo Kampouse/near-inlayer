@@ -50,7 +50,7 @@ pub struct DaemonConfig {
     pub search_paths: Vec<String>,
     /// Cloudflare tunnel URL (auto-populated when using --tunnel)
     pub tunnel_url: Option<String>,
-    /// Deposit for request_execution in yoctoNEAR (default: 7.001 NEAR)
+    /// Deposit for request_execution in yoctoNEAR (default: 1 yocto — operator covers all costs)
     /// Config accepts string to handle large u128 values beyond TOML i64 limits.
     #[serde(deserialize_with = "deserialize_yocto")]
     pub deposit_yocto: u128,
@@ -58,6 +58,19 @@ pub struct DaemonConfig {
     pub nostr_relay: Option<String>,
     /// Nostr nsec (hex, 64 chars) for signing coordination events
     pub nostr_nsec: Option<String>,
+    // ── Phase 1 Security ──────────────────────────────────────────────
+    /// Allowed program names for Nostr dispatch (default: ["kv-writer"])
+    pub allowed_programs: Vec<String>,
+    /// Allowed actions in input JSON (default: ["write"])
+    pub allowed_actions: Vec<String>,
+    /// Max entries per request (default: 100)
+    pub max_entries: usize,
+    /// Max output size in bytes (default: 1_000_000)
+    pub max_output_bytes: usize,
+    /// Max jobs per pubkey per hour (default: 60)
+    pub max_jobs_per_hour: usize,
+    /// Whether agents pay for their own runtime (default: false — operator covers all costs)
+    pub agent_pays: bool,
 }
 
 impl Default for DaemonConfig {
@@ -75,6 +88,13 @@ impl Default for DaemonConfig {
             deposit_yocto: 1u128, // 1 yocto — operator gets free execution
             nostr_relay: None,
             nostr_nsec: None,
+            // Phase 1 Security defaults
+            allowed_programs: vec!["kv-writer".to_string()],
+            allowed_actions: vec!["write".to_string()],
+            max_entries: 100,
+            max_output_bytes: 1_000_000,
+            max_jobs_per_hour: 60,
+            agent_pays: false, // Operator covers all execution costs
         }
     }
 }

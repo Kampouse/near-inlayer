@@ -220,7 +220,7 @@ pub async fn execute(
     // Try to load from compiled cache first (if checksum provided)
     let component = if let (Some(checksum), Some(cache)) = (wasm_checksum, compiled_cache) {
         // Try cache hit
-        let cached = cache.lock().ok().and_then(|mut c| c.get(checksum, &engine));
+        let cached = cache.lock().ok().and_then(|mut c| c.get(checksum, engine));
 
         if let Some(cached_component) = cached {
             debug!("⚡ Using compiled cache for {}", checksum);
@@ -228,7 +228,7 @@ pub async fn execute(
         } else {
             // Cache miss - compile from bytes
             debug!("🔨 Compiling component (cache miss): {}", checksum);
-            let component = Component::from_binary(&engine, wasm_bytes)
+            let component = Component::from_binary(engine, wasm_bytes)
                 .context("Not a valid WASI Preview 2 component")?;
 
             // Store in cache for next time
@@ -242,21 +242,21 @@ pub async fn execute(
         }
     } else {
         // No cache available - compile directly
-        Component::from_binary(&engine, wasm_bytes)
+        Component::from_binary(engine, wasm_bytes)
             .context("Not a valid WASI Preview 2 component")?
     };
 
     debug!("Loaded as WASI Preview 2 component");
 
     // Check which OutLayer SDK interfaces the WASM imports
-    let has_storage_import = component.component_type().imports(&engine)
+    let has_storage_import = component.component_type().imports(engine)
         .any(|(name, _)| name.contains("near:storage/api"));
 
     let storage_config = exec_ctx.and_then(|ctx| ctx.storage_config.as_ref());
     let use_local_storage = has_storage_import && storage_config.is_none();
 
     // Create linker with WASI and HTTP support
-    let mut linker: Linker<HostState> = Linker::new(&engine);
+    let mut linker: Linker<HostState> = Linker::new(engine);
     wasmtime_wasi::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
 
@@ -333,7 +333,7 @@ pub async fn execute(
 
     // Extract attached_usd from env_vars for payment state
     // Must be done before env_vars is consumed by wasi_builder
-    let attached_usd: u64 = env_vars
+    let _attached_usd: u64 = env_vars
         .as_ref()
         .and_then(|env| env.get("ATTACHED_USD"))
         .and_then(|s| s.parse().ok())
@@ -341,7 +341,7 @@ pub async fn execute(
 
     // Payment/VRF/Wallet removed for standalone
 
-    let vrf_state: Option<()> = None;
+    let _vrf_state: Option<()> = None;
 
 
     // Prepare stdin/stdout/stderr pipes
@@ -389,7 +389,7 @@ pub async fn execute(
     };
 
     // Create store with fuel limit + epoch deadline
-    let mut store = Store::new(&engine, host_state);
+    let mut store = Store::new(engine, host_state);
     store.set_fuel(limits.max_instructions)?;
     let timeout_secs = limits.max_execution_seconds.max(5);
     // Epoch interruption: engine ticks every second, deadline = timeout_secs ticks.
@@ -466,10 +466,7 @@ pub async fn execute(
         }
         Ok(Err(_)) | Err(_) => {
             // Check if this was an epoch interruption (timeout)
-            let err_ref = match &execution_result {
-                Err(e) => Some(e),
-                _ => None,
-            };
+            let err_ref = execution_result.as_ref().err();
             let is_epoch_timeout = err_ref
                 .map(|e| e.to_string().contains("interrupt"))
                 .unwrap_or(false);
