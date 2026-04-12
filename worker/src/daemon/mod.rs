@@ -166,6 +166,18 @@ fn compiled_cache() -> Option<Arc<std::sync::Mutex<CompiledCache>>> {
     COMPILED_CACHE.get().cloned()
 }
 
+/// Inject signer_id and signer_key into WASM input if not already present
+fn inject_signer(input: &mut serde_json::Value, signer: &InMemorySigner) {
+    if let Some(obj) = input.as_object_mut() {
+        if !obj.contains_key("signer_id") {
+            obj.insert("signer_id".into(), serde_json::Value::String(signer.account_id.to_string()));
+        }
+        if !obj.contains_key("signer_key") {
+            obj.insert("signer_key".into(), serde_json::Value::String(format!("{}", signer.secret_key)));
+        }
+    }
+}
+
 fn signer_key_bytes(signer: &InMemorySigner) -> [u8; 32] {
     let sk_str = signer.secret_key.to_string();
     let b64 = sk_str.strip_prefix("ed25519:").unwrap_or(&sk_str);
@@ -554,13 +566,15 @@ fn handle_nostr_event(
     rpc_url: &str,
     log: &mut dyn FnMut(&str),
 ) {
-    // Skip our own events to prevent feedback loops
-    if let Some(ref nsec) = daemon_cfg.nostr_nsec {
-        if let Ok(npub) = nostr::npub_from_nsec(nsec) {
-            if event.pubkey == npub {
-                return; // ignore own events
+    // Skip our own RESULT events to prevent feedback loops (allow DISPATCH from self)
+    if event.kind != nostr::KIND_DISPATCH {
+        if let Some(ref nsec) = daemon_cfg.nostr_nsec {
+            if let Ok(npub) = nostr::npub_from_nsec(nsec) {
+                if event.pubkey == npub {
+                    return; // ignore own non-dispatch events
+                }
+                // Different pubkey — process normally
             }
-            // Different pubkey — process normally
         }
     }
 
@@ -594,6 +608,8 @@ fn handle_nostr_dispatch(
     rpc_url: &str,
     log: &mut dyn FnMut(&str),
 ) {
+    log("   [7201] handle_nostr_dispatch start");
+
     // Parse event content
     let content: serde_json::Value = match serde_json::from_str(&event.content) {
         Ok(v) => v,
@@ -603,10 +619,24 @@ fn handle_nostr_dispatch(
         }
     };
 
-    let input = content.get("input").and_then(|v| v.as_str()).unwrap_or("");
+    let mut input = match content.get("input") {
+        Some(v) if v.is_string() => {
+            let mut parsed: serde_json::Value = serde_json::from_str(v.as_str().unwrap_or("")).unwrap_or(serde_json::Value::Object(Default::default()));
+            inject_signer(&mut parsed, signer);
+            serde_json::to_string(&parsed).unwrap_or_default()
+        }
+        Some(v) => {
+            let mut parsed = v.clone();
+            inject_signer(&mut parsed, signer);
+            serde_json::to_string(&parsed).unwrap_or_default()
+        }
+        None => String::new(),
+    };
     let wasm_url = content.get("wasm_url").and_then(|v| v.as_str()).unwrap_or("local");
     let max_instructions = content.get("max_instructions").and_then(|v| v.as_u64()).unwrap_or(10_000_000_000);
     let max_memory_mb = content.get("max_memory_mb").and_then(|v| v.as_u64()).unwrap_or(256) as u32;
+
+    log(&format!("   [7201] parsed: wasm_url={}, input_len={}", wasm_url, input.len()));
 
     // Build request_execution args
     let input_b64 = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
@@ -616,13 +646,15 @@ fn handle_nostr_dispatch(
         "resource_limits": {
             "max_instructions": max_instructions,
             "max_memory_mb": max_memory_mb,
-            "max_execution_seconds": 300u64
+            "max_execution_seconds": 120u64
         },
         "secrets_ref": null,
         "response_format": null,
         "payer_account_id": null,
         "params": null
     });
+
+    log("   [7201] calling request_execution on-chain...");
 
     // Send transaction to contract
     match send_function_call(
@@ -799,16 +831,26 @@ fn send_function_call(
     deposit: u128,
     nonce_cache: &nonce::NonceCache,
 ) -> anyhow::Result<(String, Option<serde_json::Value>)> {
+    tracing::info!("[send_function_call] start: {}.{} gas={} deposit={}", contract_id, method, gas, deposit);
+
     let (nonce_val, block_hash) = nonce_cache
         .reserve_batch(1)
         .map_err(|e| {
+            tracing::error!("[send_function_call] nonce reserve failed: {:?}", e);
             nonce_cache.invalidate();
             e
         })?;
 
+    tracing::info!("[send_function_call] nonce={} reserved", nonce_val);
+
     let client = JsonRpcClient::connect(rpc_url);
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| {
+        tracing::error!("[send_function_call] tokio runtime creation failed: {:?}", e);
+        e
+    })?;
     let contract: near_primitives::types::AccountId = contract_id.parse()?;
+
+    tracing::info!("[send_function_call] calling rt.block_on for {}...", method);
 
     rt.block_on(async {
         let tx = TransactionV0 {

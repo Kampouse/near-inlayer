@@ -72,7 +72,7 @@ impl Default for DaemonConfig {
             dashboard_addr: None,
             search_paths: vec!["./wasi-examples".to_string()],
             tunnel_url: None,
-            deposit_yocto: 7_001_000_000_000_000_000_000u128, // 7.001 NEAR
+            deposit_yocto: 1u128, // 1 yocto — operator gets free execution
             nostr_relay: None,
             nostr_nsec: None,
         }

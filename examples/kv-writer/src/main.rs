@@ -41,7 +41,7 @@ fn main() {
 
     match action {
         "write" => {
-            let receiver_id = inp.receiver_id.unwrap_or_else(|| inp.signer_id.clone());
+            let receiver_id = inp.receiver_id.unwrap_or_else(|| "kv.kampouse.near".to_string());
             let count = inp.entries.len();
             let args = serde_json::to_string(&inp.entries).unwrap();
 
