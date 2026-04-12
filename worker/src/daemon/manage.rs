@@ -229,8 +229,11 @@ impl DaemonConfig {
     pub fn rpc_urls(&self) -> Vec<String> {
         match self.network.as_str() {
             "mainnet" => vec![
-                "https://rpc.mainnet.near.org".into(),
+                "https://rpc.fastnear.com".into(),
+                "https://near.drpc.org".into(),
                 "https://near.lava.build".into(),
+                "https://near-rpc.publicnode.com".into(),
+                "https://near-mainnet.api.pagoda.co/rpc/v1".into(),
             ],
             "testnet" => vec![
                 "https://rpc.testnet.fastnear.com".into(),
