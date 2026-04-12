@@ -554,6 +554,16 @@ fn handle_nostr_event(
     rpc_url: &str,
     log: &mut dyn FnMut(&str),
 ) {
+    // Skip our own events to prevent feedback loops
+    if let Some(ref nsec) = daemon_cfg.nostr_nsec {
+        if let Ok(npub) = nostr::npub_from_nsec(nsec) {
+            if event.pubkey == npub {
+                return; // ignore own events
+            }
+            // Different pubkey — process normally
+        }
+    }
+
     match event.kind {
         nostr::KIND_DISPATCH => {
             log(&format!(" nostr DISPATCH from {}...", &event.pubkey[..8.min(event.pubkey.len())]));
@@ -1205,7 +1215,26 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                                 })).unwrap_or_default()
                             );
                             log(&format!("   Tx: {}", hash));
+                        }
 
+                        // Publish kind 7203 (result) to Nostr after on-chain resolve
+                        if wr.1 {
+                            if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
+                                let result_content = serde_json::json!({
+                                    "job_id": req_id,
+                                    "result": wr.3,
+                                    "success": wr.1,
+                                    "instructions": wr.5,
+                                    "time_ms": wr.4,
+                                    "tx_hash": resolve_hash,
+                                });
+                                let content_str = serde_json::to_string(&result_content).unwrap_or_default();
+                                let tags = vec![vec!["job".into(), req_id.to_string()]];
+                                match nostr::publish_event(relay, nsec, nostr::KIND_RESULT, &content_str, tags) {
+                                    Ok(()) => log(&format!("   published kind 7203 (result) for job={} ✓", req_id)),
+                                    Err(e) => log(&format!("   failed to publish 7203: {}", e)),
+                                }
+                            }
                         }
                     }
                     match tx_result {
