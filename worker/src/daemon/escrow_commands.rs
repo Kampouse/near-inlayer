@@ -6,7 +6,8 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -16,6 +17,111 @@ use serde::{Deserialize, Serialize};
 use super::manage::DaemonConfig;
 use super::nonce::NonceCache;
 use super::rpc_pool;
+
+// ── Thread health monitoring ──────────────────────────────────────────
+
+/// Heartbeat for a background thread. The thread sets `alive` to true each
+/// cycle. A supervisor reads and resets it — if still false after N checks,
+/// the thread is considered dead.
+#[derive(Debug)]
+pub struct ThreadHealth {
+    pub name: String,
+    pub alive: AtomicBool,
+    pub restart_count: AtomicBool, // u8 via AtomicBool — just tracking if restarted
+}
+
+impl ThreadHealth {
+    pub fn new(name: &str) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.to_string(),
+            alive: AtomicBool::new(true),
+            restart_count: AtomicBool::new(false),
+        })
+    }
+
+    /// Called by the worker thread each successful cycle.
+    pub fn ping(&self) {
+        self.alive.store(true, Ordering::Relaxed);
+    }
+
+    /// Called by the supervisor. Returns true if the thread pinged since last check.
+    /// Resets the flag.
+    pub fn check_and_reset(&self) -> bool {
+        self.alive.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Spawn a supervisor thread that monitors health heartbeats and re-spawns
+/// threads if they go silent for too long.
+pub fn spawn_supervisor(
+    config_dir: std::path::PathBuf,
+    relayer_health: Arc<ThreadHealth>,
+    verifier_health: Option<Arc<ThreadHealth>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("escrow-supervisor".into())
+        .spawn(move || {
+            let check_interval = Duration::from_secs(30);
+            let max_missed = 6; // 6 * 30s = 3 minutes silent = dead
+            let mut relayer_missed: u32 = 0;
+            let mut verifier_missed: u32 = 0;
+
+            eprintln!("[supervisor] started — checking every {}s", check_interval.as_secs());
+
+            loop {
+                std::thread::sleep(check_interval);
+
+                // Check relayer
+                if relayer_health.check_and_reset() {
+                    relayer_missed = 0;
+                } else {
+                    relayer_missed += 1;
+                    if relayer_missed >= max_missed {
+                        eprintln!("[supervisor] relayer silent for {} checks — restarting", relayer_missed);
+                        relayer_missed = 0;
+                        let cfg = config_dir.clone();
+                        let health = relayer_health.clone();
+                        std::thread::spawn(move || {
+                            eprintln!("[supervisor] spawning new relayer thread...");
+                            let handle = spawn_relayer_thread(cfg);
+                            health.ping(); // Mark alive on spawn
+                            let _ = handle.join();
+                            eprintln!("[supervisor] relayer thread exited");
+                        });
+                        relayer_health.restart_count.store(true, Ordering::Relaxed);
+                    } else if relayer_missed > 1 {
+                        eprintln!("[supervisor] relayer missed {} heartbeat(s)", relayer_missed);
+                    }
+                }
+
+                // Check verifier
+                if let Some(ref vh) = verifier_health {
+                    if vh.check_and_reset() {
+                        verifier_missed = 0;
+                    } else {
+                        verifier_missed += 1;
+                        if verifier_missed >= max_missed {
+                            eprintln!("[supervisor] verifier silent for {} checks — restarting", verifier_missed);
+                            verifier_missed = 0;
+                            let cfg = config_dir.clone();
+                            let health = vh.clone();
+                            std::thread::spawn(move || {
+                                eprintln!("[supervisor] spawning new verifier thread...");
+                                let handle = spawn_verifier_thread(cfg);
+                                health.ping();
+                                let _ = handle.join();
+                                eprintln!("[supervisor] verifier thread exited");
+                            });
+                            vh.restart_count.store(true, Ordering::Relaxed);
+                        } else if verifier_missed > 1 {
+                            eprintln!("[supervisor] verifier missed {} heartbeat(s)", verifier_missed);
+                        }
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn supervisor thread")
+}
 
 // ── Shared helpers ──────────────────────────────────────────────────────
 
@@ -229,7 +335,7 @@ pub fn cmd_relayer(args: &[String], config_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    run_relayer_inner(&daemon_cfg, &rpc_url, &signer, &nonce_cache)
+    run_relayer_inner(&daemon_cfg, &rpc_url, &signer, &nonce_cache, None)
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -500,6 +606,13 @@ fn score_with_gemini(
 /// Spawn the relayer as a background thread (called from daemon when execution_mode is escrow/both).
 /// Takes config_dir so it can load its own DaemonConfig, signer, NonceCache.
 pub fn spawn_relayer_thread(config_dir: std::path::PathBuf) -> std::thread::JoinHandle<()> {
+    spawn_relayer_thread_with_health(config_dir, None)
+}
+
+pub fn spawn_relayer_thread_with_health(
+    config_dir: std::path::PathBuf,
+    health: Option<Arc<ThreadHealth>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("escrow-relayer".into())
         .spawn(move || {
@@ -521,7 +634,7 @@ pub fn spawn_relayer_thread(config_dir: std::path::PathBuf) -> std::thread::Join
             };
             let nonce_cache = NonceCache::new(rpc_url.clone(), signer.clone());
 
-            if let Err(e) = run_relayer_inner(&daemon_cfg, &rpc_url, &signer, &nonce_cache) {
+            if let Err(e) = run_relayer_inner(&daemon_cfg, &rpc_url, &signer, &nonce_cache, health.as_ref()) {
                 eprintln!("[relayer] thread exited with error: {}", e);
             }
         })
@@ -530,6 +643,13 @@ pub fn spawn_relayer_thread(config_dir: std::path::PathBuf) -> std::thread::Join
 
 /// Spawn the verifier as a background thread (called from daemon when execution_mode is escrow/both).
 pub fn spawn_verifier_thread(config_dir: std::path::PathBuf) -> std::thread::JoinHandle<()> {
+    spawn_verifier_thread_with_health(config_dir, None)
+}
+
+pub fn spawn_verifier_thread_with_health(
+    config_dir: std::path::PathBuf,
+    health: Option<Arc<ThreadHealth>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("escrow-verifier".into())
         .spawn(move || {
@@ -582,6 +702,12 @@ pub fn spawn_verifier_thread(config_dir: std::path::PathBuf) -> std::thread::Joi
                         eprintln!("[verifier]   cycle error: {}", e);
                     }
                 }
+
+                // Heartbeat
+                if let Some(h) = health.as_ref() {
+                    h.ping();
+                }
+
                 std::thread::sleep(Duration::from_secs(3));
             }
         })
@@ -594,6 +720,7 @@ fn run_relayer_inner(
     rpc_url: &str,
     signer: &near_crypto::InMemorySigner,
     nonce_cache: &NonceCache,
+    health: Option<&Arc<ThreadHealth>>,
 ) -> Result<()> {
     let relay = daemon_cfg.nostr_relay.as_deref()
         .ok_or_else(|| anyhow::anyhow!("nostr_relay not configured"))?;
@@ -691,6 +818,11 @@ fn run_relayer_inner(
             Err(e) => {
                 eprintln!("[relayer]   submit FAILED: {}", e);
             }
+        }
+
+        // Heartbeat
+        if let Some(h) = health {
+            h.ping();
         }
 
         // For kind 41000 (Task), also submit fund_action if present

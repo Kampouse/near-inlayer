@@ -1386,17 +1386,24 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     let execution_mode = daemon_cfg.execution_mode.clone();
     if execution_mode == "escrow" || execution_mode == "both" {
         let config_dir_clone = config_dir.to_path_buf();
-        let relayer_handle = escrow_commands::spawn_relayer_thread(config_dir_clone.clone());
+        let has_verifier = daemon_cfg.escrow_contract.is_some() && std::env::var("GEMINI_API_KEY").is_ok();
+
+        // Use health-monitored threads with supervisor
+        let relayer_health = escrow_commands::ThreadHealth::new("relayer");
+        let verifier_health = escrow_commands::ThreadHealth::new("verifier");
+
+        let _relayer_handle = escrow_commands::spawn_relayer_thread_with_health(
+            config_dir_clone.clone(),
+            Some(relayer_health.clone()),
+        );
         log(&format!("Escrow relayer thread spawned (mode={})", execution_mode));
 
-        if daemon_cfg.escrow_contract.is_some() && std::env::var("GEMINI_API_KEY").is_ok() {
-            let verifier_handle = escrow_commands::spawn_verifier_thread(config_dir_clone);
+        if has_verifier {
+            let _verifier_handle = escrow_commands::spawn_verifier_thread_with_health(
+                config_dir_clone.clone(),
+                Some(verifier_health.clone()),
+            );
             log("Escrow verifier thread spawned");
-            // Keep handles alive so threads don't detach silently
-            std::thread::spawn(move || {
-                let _ = relayer_handle.join();
-                let _ = verifier_handle.join();
-            });
         } else {
             if daemon_cfg.escrow_contract.is_none() {
                 log("Escrow verifier NOT started: escrow_contract not configured");
@@ -1404,9 +1411,15 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
             if std::env::var("GEMINI_API_KEY").is_err() {
                 log("Escrow verifier NOT started: GEMINI_API_KEY not set");
             }
-            // Just keep relayer handle alive
-            std::thread::spawn(move || { let _ = relayer_handle.join(); });
         }
+
+        // Start supervisor — monitors heartbeats, respawns dead threads
+        let _supervisor = escrow_commands::spawn_supervisor(
+            config_dir_clone,
+            relayer_health,
+            if has_verifier { Some(verifier_health) } else { None },
+        );
+        log("Escrow supervisor thread spawned");
     }
 
     let mut consecutive_errors = 0u32;
