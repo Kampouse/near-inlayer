@@ -1,11 +1,12 @@
 //! Nostr subscriber — listens to relay for agent coordination events.
 //!
-//! Kinds:
-//!   7201 — dispatch    (Hermes A submits a task)
-//!   7202 — available   (daemon acknowledges, includes contract request_id)
-//!   7203 — result      (Hermes B submits work result)
-//!   7204 — claim       (Hermes B claims a job)
-//!   7205 — confirmed   (daemon confirms on-chain resolution)
+//! Kinds (41xxx namespace — merged escrow + inlayer protocol):
+//!   41000 — Task posted    (agent posts task + create_escrow + fund_escrow actions)
+//!   41001 — Claimed        (worker/daemon claims the job)
+//!   41002 — Result         (work result submitted)
+//!   41003 — Action         (generic msig action: fund, cancel, withdraw, rotate)
+//!   41004 — Dispatched     (daemon starts execution)
+//!   41005 — Confirmed      (settlement confirmed on-chain)
 //!
 //! The subscriber runs in a background thread with its own tokio runtime
 //! (same pattern as block watcher). Events are forwarded via crossbeam channel.
@@ -14,16 +15,26 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 
-// ── Coordination kinds ─────────────────────────────────────────────────────
+// ── Coordination kinds (41xxx merged namespace) ─────────────────────────
 
-pub const KIND_DISPATCH: u64 = 7201;
-pub const KIND_JOB_AVAILABLE: u64 = 7202;
-pub const KIND_RESULT: u64 = 7203;
-pub const KIND_CLAIM: u64 = 7204;
-pub const KIND_CONFIRMED: u64 = 7205;
+pub const KIND_TASK: u64 = 41000;
+pub const KIND_CLAIM: u64 = 41001;
+pub const KIND_RESULT: u64 = 41002;
+pub const KIND_ACTION: u64 = 41003;
+pub const KIND_DISPATCH: u64 = 41004;
+pub const KIND_CONFIRMED: u64 = 41005;
+
+/// Legacy kinds (7201-7205) — kept for backward compat during migration.
+pub mod legacy {
+    pub const KIND_DISPATCH: u64 = 7201;
+    pub const KIND_JOB_AVAILABLE: u64 = 7202;
+    pub const KIND_RESULT: u64 = 7203;
+    pub const KIND_CLAIM: u64 = 7204;
+    pub const KIND_CONFIRMED: u64 = 7205;
+}
 
 /// Kinds the daemon subscribes to.
-const SUBSCRIPTION_KINDS: &[u64] = &[KIND_DISPATCH, KIND_RESULT, KIND_CLAIM];
+const SUBSCRIPTION_KINDS: &[u64] = &[KIND_TASK, KIND_CLAIM, KIND_RESULT, KIND_ACTION];
 
 // ── Parsed event ───────────────────────────────────────────────────────────
 
@@ -161,10 +172,11 @@ fn normalize_relay_url(url: &str) -> String {
 
 fn kind_label(kind: u64) -> &'static str {
     match kind {
-        KIND_DISPATCH => "dispatch",
-        KIND_JOB_AVAILABLE => "job-available",
-        KIND_RESULT => "result",
+        KIND_TASK => "task",
         KIND_CLAIM => "claim",
+        KIND_RESULT => "result",
+        KIND_ACTION => "action",
+        KIND_DISPATCH => "dispatch",
         KIND_CONFIRMED => "confirmed",
         _ => "unknown",
     }

@@ -35,6 +35,11 @@ fn deserialize_yocto<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Resul
     deserializer.deserialize_any(YoctoVisitor)
 }
 
+/// Default worker stake: 0.1 NEAR in yoctoNEAR.
+fn default_worker_stake() -> u128 {
+    100_000_000_000_000_000_000_000 // 0.1 NEAR
+}
+
 /// Daemon configuration fields (merged into inlayer Config).
 /// These are daemon-specific settings that complement the base inlayer Config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -71,6 +76,21 @@ pub struct DaemonConfig {
     pub max_jobs_per_hour: usize,
     /// Whether agents pay for their own runtime (default: false — operator covers all costs)
     pub agent_pays: bool,
+    // ── Escrow mode ──────────────────────────────────────────────────
+    /// Execution mode: "direct" (inlayer contract), "escrow" (escrow contract), or "both"
+    pub execution_mode: String,
+    /// Escrow contract account ID (e.g. "escrow.kampouse.testnet")
+    pub escrow_contract: Option<String>,
+    /// FastNear KV account for writing results (e.g. "kv.kampouse.near")
+    pub kv_account: Option<String>,
+    /// Worker stake in yoctoNEAR for escrow claims (default: 0.1 NEAR)
+    #[serde(default = "default_worker_stake")]
+    #[serde(deserialize_with = "deserialize_yocto")]
+    pub worker_stake_yocto: u128,
+    /// Timeout in seconds to wait for escrow to be funded (default: 600)
+    pub escrow_fund_timeout_secs: u64,
+    /// Timeout in seconds to wait for escrow settlement after result submission (default: 600)
+    pub escrow_settle_timeout_secs: u64,
 }
 
 impl Default for DaemonConfig {
@@ -80,7 +100,10 @@ impl Default for DaemonConfig {
             contract_id: "outlayer.kampouse.testnet".to_string(),
             account_id: "your-account.testnet".to_string(),
             network: "testnet".to_string(),
-            key_path: format!("{}/.near-credentials/testnet/your-account.testnet.json", home.display()),
+            key_path: format!(
+                "{}/.near-credentials/testnet/your-account.testnet.json",
+                home.display()
+            ),
             poll_interval_secs: 5,
             dashboard_addr: None,
             search_paths: vec!["./wasi-examples".to_string()],
@@ -95,6 +118,13 @@ impl Default for DaemonConfig {
             max_output_bytes: 1_000_000,
             max_jobs_per_hour: 60,
             agent_pays: false, // Operator covers all execution costs
+            // Escrow mode defaults
+            execution_mode: "direct".to_string(),
+            escrow_contract: None,
+            kv_account: None,
+            worker_stake_yocto: default_worker_stake(),
+            escrow_fund_timeout_secs: 600,
+            escrow_settle_timeout_secs: 600,
         }
     }
 }

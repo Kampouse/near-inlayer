@@ -1693,6 +1693,15 @@ Environment Variables:\n\
             // Delegate to daemon module
             offchainvm_worker::daemon::run_daemon(&args[2..], &config_dir)?;
         }
+        "post-task" => {
+            offchainvm_worker::daemon::escrow_commands::cmd_post_task(&args[2..], &config_dir)?;
+        }
+        "relayer" => {
+            offchainvm_worker::daemon::escrow_commands::cmd_relayer(&args[2..], &config_dir)?;
+        }
+        "verifier" => {
+            offchainvm_worker::daemon::escrow_commands::cmd_verifier(&args[2..], &config_dir)?;
+        }
         cmd => { eprintln!("Unknown: {}. Run: inlayer help", cmd); std::process::exit(1); }
     }
     Ok(())

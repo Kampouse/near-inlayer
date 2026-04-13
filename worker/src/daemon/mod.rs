@@ -32,6 +32,8 @@ use crate::outlayer_rpc::RpcProxy;
 
 // Re-export submodules
 mod api;
+mod escrow_client;
+pub mod escrow_commands;
 mod manage;
 mod nonce;
 mod payment;
@@ -676,7 +678,7 @@ fn handle_nostr_event(
     log: &mut dyn FnMut(&str),
 ) {
     // Skip our own RESULT events to prevent feedback loops (allow DISPATCH from self)
-    if event.kind != nostr::KIND_DISPATCH {
+    if event.kind != nostr::KIND_TASK {
         if let Some(ref nsec) = daemon_cfg.nostr_nsec {
             if let Ok(npub) = nostr::npub_from_nsec(nsec) {
                 if event.pubkey == npub {
@@ -688,7 +690,7 @@ fn handle_nostr_event(
     }
 
     match event.kind {
-        nostr::KIND_DISPATCH => {
+        nostr::KIND_TASK => {
             log(&format!(" nostr DISPATCH from {}...", &event.pubkey[..8.min(event.pubkey.len())]));
             handle_nostr_dispatch(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
         }
@@ -706,9 +708,12 @@ fn handle_nostr_event(
     }
 }
 
-/// Kind 7201 — Hermes A dispatched a task.
+/// Kind 41000 — Agent posted a task.
 ///
-/// Flow: parse content → call request_execution() on contract → publish kind 7202 (job available).
+/// Routes based on execution_mode:
+///   "direct" → call request_execution() on inlayer contract (existing flow)
+///   "escrow" → claim on escrow contract → route to worker → write KV → submit result
+///   "both"   → direct for inlayer tasks, escrow for tasks with escrow tags
 fn handle_nostr_dispatch(
     event: &nostr::NostrEvent,
     daemon_cfg: &DaemonConfig,
@@ -717,12 +722,128 @@ fn handle_nostr_dispatch(
     rpc_url: &str,
     log: &mut dyn FnMut(&str),
 ) {
-    log("   [7201] handle_nostr_dispatch start");
+    log("   [41000] handle_nostr_dispatch start");
+
+    match daemon_cfg.execution_mode.as_str() {
+        "escrow" => handle_nostr_dispatch_escrow(event, daemon_cfg, signer, nonce_cache, rpc_url, log),
+        "both" => {
+            // If event has escrow tags (action_sig + fund_action_sig), route to escrow
+            let has_escrow_tags = event.tags.iter().any(|t| t.len() >= 2 && t[0] == "fund_action_sig");
+            if has_escrow_tags {
+                log("   [41000] both mode: routing to escrow (has escrow tags)");
+                handle_nostr_dispatch_escrow(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
+            } else {
+                log("   [41000] both mode: routing to direct (no escrow tags)");
+                handle_nostr_dispatch_direct(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
+            }
+        }
+        _ => handle_nostr_dispatch_direct(event, daemon_cfg, signer, nonce_cache, rpc_url, log),
+    }
+}
+
+/// Escrow mode handler for kind 41000.
+/// Flow: parse event → poll escrow until Open → claim → route to worker → write KV → submit result → wait for settlement
+fn handle_nostr_dispatch_escrow(
+    event: &nostr::NostrEvent,
+    daemon_cfg: &DaemonConfig,
+    signer: &InMemorySigner,
+    nonce_cache: &nonce::NonceCache,
+    rpc_url: &str,
+    log: &mut dyn FnMut(&str),
+) {
+    let escrow_contract = match daemon_cfg.escrow_contract {
+        Some(ref c) => c.as_str(),
+        None => { log("   [escrow] escrow_contract not configured — skipping"); return; }
+    };
+    let kv_account = match daemon_cfg.kv_account {
+        Some(ref c) => c.as_str(),
+        None => { log("   [escrow] kv_account not configured — skipping"); return; }
+    };
+
+    // Parse job_id from event tags
+    let job_id = event.tags.iter()
+        .find(|t| t.len() >= 2 && t[0] == "job_id")
+        .and_then(|t| t.get(1))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    if job_id.is_empty() {
+        log("   [escrow] no job_id tag in event — skipping");
+        return;
+    }
+
+    log(&format!("   [escrow] processing job_id={}", job_id));
+
+    // Build RPC pool for view calls
+    let rpc = match rpc_pool::Rpc::new(rpc_url) {
+        Ok(r) => r,
+        Err(e) => { log(&format!("   [escrow] RPC init failed: {}", e)); return; }
+    };
+
+    // Run the full escrow flow
+    let result = escrow_client::run_escrow_job(
+        &rpc,
+        rpc_url,
+        signer,
+        escrow_contract,
+        kv_account,
+        job_id,
+        daemon_cfg.worker_stake_yocto,
+        nonce_cache,
+        |_task_desc, _criteria| {
+            // TODO: Route to actual worker agent
+            // For now, return a placeholder
+            Ok("placeholder result".to_string())
+        },
+    );
+
+    match result {
+        Ok(job_result) => {
+            log(&format!(
+                "   [escrow] {} settled: {} (claim={}, kv={}, result={})",
+                job_result.job_id, job_result.final_status,
+                &job_result.tx_hash_claim[..12.min(job_result.tx_hash_claim.len())],
+                &job_result.tx_hash_kv[..12.min(job_result.tx_hash_kv.len())],
+                &job_result.tx_hash_result[..12.min(job_result.tx_hash_result.len())],
+            ));
+
+            // Publish kind 41005 (confirmed) to Nostr
+            if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
+                let response = serde_json::json!({
+                    "job_id": job_result.job_id,
+                    "status": job_result.final_status,
+                    "kv_key": job_result.kv_reference.kv_key,
+                });
+                let content_str = serde_json::to_string(&response).unwrap_or_default();
+                let tags = vec![vec!["e".into(), event.id.clone()], vec!["p".into(), event.pubkey.clone()]];
+                match nostr::publish_event(relay, nsec, nostr::KIND_CONFIRMED, &content_str, tags) {
+                    Ok(()) => log("   published kind 41005 (confirmed) ✓"),
+                    Err(e) => log(&format!("   failed to publish 41005: {}", e)),
+                }
+            }
+        }
+        Err(e) => {
+            log(&format!("   [escrow] {} FAILED: {}", job_id, e));
+        }
+    }
+}
+
+/// Direct mode handler for kind 41000 (original inlayer flow).
+/// Flow: parse content → call request_execution() on contract → publish kind 41004 (dispatched).
+fn handle_nostr_dispatch_direct(
+    event: &nostr::NostrEvent,
+    daemon_cfg: &DaemonConfig,
+    signer: &InMemorySigner,
+    nonce_cache: &nonce::NonceCache,
+    rpc_url: &str,
+    log: &mut dyn FnMut(&str),
+) {
+    log("   [41000] handle_nostr_dispatch start");
 
     // ── Phase 1 Security: Rate limiting ────────────────────────────────
     if !check_rate_limit(&event.pubkey, daemon_cfg.max_jobs_per_hour) {
         log(&format!("   RATE LIMITED: {} exceeded {} jobs/hour", &event.pubkey[..8.min(event.pubkey.len())], daemon_cfg.max_jobs_per_hour));
-        // Publish 7203 error result
+        // Publish 41002 error result
         if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
             let err_content = serde_json::json!({
                 "job_id": 0u64,
@@ -764,7 +885,7 @@ fn handle_nostr_dispatch(
 
     if let Err(reason) = validate_input(&input_val, daemon_cfg) {
         log(&format!("   INPUT REJECTED: {}", reason));
-        // Publish 7203 error result
+        // Publish 41002 error result
         if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
             let err_content = serde_json::json!({
                 "job_id": 0u64,
@@ -795,7 +916,7 @@ fn handle_nostr_dispatch(
     let max_instructions = content.get("max_instructions").and_then(|v| v.as_u64()).unwrap_or(10_000_000_000);
     let max_memory_mb = content.get("max_memory_mb").and_then(|v| v.as_u64()).unwrap_or(256) as u32;
 
-    log(&format!("   [7201] parsed: wasm_url={}, input_len={}", wasm_url, input.len()));
+    log(&format!("   [41000] parsed: wasm_url={}, input_len={}", wasm_url, input.len()));
 
     // Build request_execution args
     let input_b64 = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
@@ -813,7 +934,7 @@ fn handle_nostr_dispatch(
         "params": null
     });
 
-    log("   [7201] calling request_execution on-chain...");
+    log("   [41000] calling request_execution on-chain...");
 
     // Send transaction to contract
     match send_function_call(
@@ -835,7 +956,7 @@ fn handle_nostr_dispatch(
 
             log(&format!("   job_id={} creator={}", request_id, &event.pubkey[..16.min(event.pubkey.len())]));
 
-            // Publish kind 7202 (job available) to Nostr
+            // Publish kind 41004 (job available) to Nostr
             if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
                 let response = serde_json::json!({
                     "job_id": request_id,
@@ -846,12 +967,12 @@ fn handle_nostr_dispatch(
                 });
                 let content_str = serde_json::to_string(&response).unwrap_or_default();
                 let tags = vec![vec!["e".into(), event.id.clone()], vec!["p".into(), event.pubkey.clone()]];
-                match nostr::publish_event(relay, nsec, nostr::KIND_JOB_AVAILABLE, &content_str, tags) {
-                    Ok(()) => log("   published kind 7202 (job available) ✓"),
-                    Err(e) => log(&format!("   failed to publish 7202: {}", e)),
+                match nostr::publish_event(relay, nsec, nostr::KIND_DISPATCH, &content_str, tags) {
+                    Ok(()) => log("   published kind 41004 (job available) ✓"),
+                    Err(e) => log(&format!("   failed to publish 41004: {}", e)),
                 }
             } else {
-                log("   (nostr_relay or nostr_nsec not configured — skipping 7202 publish)");
+                log("   (nostr_relay or nostr_nsec not configured — skipping 41004 publish)");
             }
         }
         Err(e) => {
@@ -861,9 +982,9 @@ fn handle_nostr_dispatch(
     }
 }
 
-/// Kind 7203 — Hermes B submitted a result.
+/// Kind 41002 — Work result submitted.
 ///
-/// Flow: parse content → call resolve_execution() on contract → publish kind 7205 (confirmed).
+/// Flow: parse content → call resolve_execution() on contract → publish kind 41005 (confirmed).
 fn handle_nostr_result(
     event: &nostr::NostrEvent,
     daemon_cfg: &DaemonConfig,
@@ -916,7 +1037,7 @@ fn handle_nostr_result(
         Ok((tx_hash, _return_value)) => {
             log(&format!("   resolve_execution job={} tx={}", job_id, tx_hash));
 
-            // Publish kind 7205 (confirmed on-chain)
+            // Publish kind 41005 (confirmed on-chain)
             if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
                 let response = serde_json::json!({
                     "job_id": job_id,
@@ -928,8 +1049,8 @@ fn handle_nostr_result(
                 let content_str = serde_json::to_string(&response).unwrap_or_default();
                 let tags = vec![vec!["e".into(), event.id.clone()], vec!["p".into(), event.pubkey.clone()]];
                 match nostr::publish_event(relay, nsec, nostr::KIND_CONFIRMED, &content_str, tags) {
-                    Ok(()) => log("   published kind 7205 (confirmed) ✓"),
-                    Err(e) => log(&format!("   failed to publish 7205: {}", e)),
+                    Ok(()) => log("   published kind 41005 (confirmed) ✓"),
+                    Err(e) => log(&format!("   failed to publish 41005: {}", e)),
                 }
             }
         }
@@ -940,9 +1061,9 @@ fn handle_nostr_result(
     }
 }
 
-/// Kind 7204 — Hermes B claims a job.
+/// Kind 41001 — Worker claims a job.
 ///
-/// Flow: parse content → log claim → publish kind 7202 update.
+/// Flow: parse content → log claim → publish kind 41004 update.
 /// (Contract claim handling depends on contract API — logging for now.)
 fn handle_nostr_claim(
     event: &nostr::NostrEvent,
@@ -960,7 +1081,7 @@ fn handle_nostr_claim(
     let job_id = content.get("job_id").and_then(|v| v.as_u64()).unwrap_or(0);
     log(&format!("   job={} claimed by {}", job_id, &event.pubkey[..16.min(event.pubkey.len())]));
 
-    // Publish kind 7202 update (claimed status)
+    // Publish kind 41004 update (claimed status)
     if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
         let response = serde_json::json!({
             "job_id": job_id,
@@ -969,9 +1090,9 @@ fn handle_nostr_claim(
         });
         let content_str = serde_json::to_string(&response).unwrap_or_default();
         let tags = vec![vec!["e".into(), event.id.clone()], vec!["p".into(), event.pubkey.clone()]];
-        match nostr::publish_event(relay, nsec, nostr::KIND_JOB_AVAILABLE, &content_str, tags) {
-            Ok(()) => log("   published kind 7202 update (claimed) ✓"),
-            Err(e) => log(&format!("   failed to publish 7202 update: {}", e)),
+        match nostr::publish_event(relay, nsec, nostr::KIND_DISPATCH, &content_str, tags) {
+            Ok(()) => log("   published kind 41004 update (claimed) ✓"),
+            Err(e) => log(&format!("   failed to publish 41004 update: {}", e)),
         }
     }
 }
@@ -1261,6 +1382,33 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
         rx
     });
 
+    // ── Escrow background threads (relayer + verifier) ─────────────────
+    let execution_mode = daemon_cfg.execution_mode.clone();
+    if execution_mode == "escrow" || execution_mode == "both" {
+        let config_dir_clone = config_dir.to_path_buf();
+        let relayer_handle = escrow_commands::spawn_relayer_thread(config_dir_clone.clone());
+        log(&format!("Escrow relayer thread spawned (mode={})", execution_mode));
+
+        if daemon_cfg.escrow_contract.is_some() && std::env::var("GEMINI_API_KEY").is_ok() {
+            let verifier_handle = escrow_commands::spawn_verifier_thread(config_dir_clone);
+            log("Escrow verifier thread spawned");
+            // Keep handles alive so threads don't detach silently
+            std::thread::spawn(move || {
+                let _ = relayer_handle.join();
+                let _ = verifier_handle.join();
+            });
+        } else {
+            if daemon_cfg.escrow_contract.is_none() {
+                log("Escrow verifier NOT started: escrow_contract not configured");
+            }
+            if std::env::var("GEMINI_API_KEY").is_err() {
+                log("Escrow verifier NOT started: GEMINI_API_KEY not set");
+            }
+            // Just keep relayer handle alive
+            std::thread::spawn(move || { let _ = relayer_handle.join(); });
+        }
+    }
+
     let mut consecutive_errors = 0u32;
     let last_rpc_poll = std::time::Instant::now();
     let min_rpc_interval = Duration::from_secs(daemon_cfg.poll_interval_secs.max(5));
@@ -1425,7 +1573,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                             log(&format!("   Tx: {}", hash));
                         }
 
-                        // Publish kind 7203 (result) to Nostr after on-chain resolve
+                        // Publish kind 41002 (result) to Nostr after on-chain resolve
                         if wr.1 {
                             if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
                                 let result_content = serde_json::json!({
@@ -1439,8 +1587,8 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                                 let content_str = serde_json::to_string(&result_content).unwrap_or_default();
                                 let tags = vec![vec!["job".into(), req_id.to_string()]];
                                 match nostr::publish_event(relay, nsec, nostr::KIND_RESULT, &content_str, tags) {
-                                    Ok(()) => log(&format!("   published kind 7203 (result) for job={} ✓", req_id)),
-                                    Err(e) => log(&format!("   failed to publish 7203: {}", e)),
+                                    Ok(()) => log(&format!("   published kind 41002 (result) for job={} ✓", req_id)),
+                                    Err(e) => log(&format!("   failed to publish 41002: {}", e)),
                                 }
                             }
                         }
