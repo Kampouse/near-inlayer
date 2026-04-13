@@ -1,48 +1,296 @@
-# OutLayer Standalone — Offchain WASM Compute on NEAR
+# near-inlayer — Offchain WASM Compute + Escrow Daemon
 
-## Overview
-OutLayer lets you run WASM offchain workers that poll a NEAR contract for jobs, execute them locally, and resolve results on-chain.
+WASM execution engine for NEAR Protocol. Runs as a daemon that polls for jobs, executes WASM locally, and resolves results on-chain. In escrow mode, the daemon also runs relayer and verifier threads — one process handles everything.
+
+Paired with [near-escrow](../near-escrow/) for the agent-to-agent task marketplace.
+
+## Architecture
+
+```
+                        NEAR Protocol
+                  ┌───────────────────────────────────────────┐
+                  │                                           │
+                  │  ┌──────────────┐  ┌──────────────────┐  │
+                  │  │  Agent Msig  │  │ Escrow Contract  │  │
+                  │  │  execute()◄──┤  │ claim()          │  │
+                  │  └──────────────┘  │ submit_result()──┤  │
+                  │                    │    YIELDS         │  │
+                  │  ┌──────────────┐  │       │          │  │
+                  │  │ Job Queue    │  │ resume_verify()◄─┤  │
+                  │  │ Contract     │  │ settlement()     │  │
+                  │  └──────────────┘  └──────────────────┘  │
+                  │                                           │
+                  └───────────────────────────────────────────┘
+                            ▲
+                            │ RPC
+                  ┌─────────┴─────────────────────────────────┐
+                  │          inlayer daemon (1 process)        │
+                  │                                           │
+                  │  ┌──────────┐ ┌────────┐ ┌────────────┐  │
+                  │  │ Relayer  │ │ Worker │ │  Verifier  │  │
+                  │  │ Thread   │ │ Thread │ │  Thread    │  │
+                  │  │          │ │        │ │            │  │
+                  │  │ Nostr    │ │ claim  │ │ poll       │  │
+                  │  │ →msig    │ │ →WASM  │ │ →Gemini    │  │
+                  │  │ →chain   │ │ →KV    │ │ →resume    │  │
+                  │  └──────────┘ └────────┘ └────────────┘  │
+                  │                                           │
+                  └───────────────────────────────────────────┘
+                            ▲                    ▲
+                            │ Nostr              │ HTTP
+                  ┌─────────┴──────┐    ┌────────┴─────────┐
+                  │  Nostr Relay   │    │  FastNear KV     │
+                  │  kind 41000-   │    │  kv.kampouse.near│
+                  │  41005         │    │                  │
+                  └────────────────┘    │  result/{job_id} │
+                                        └──────────────────┘
+```
+
+## Nostr ↔ Contract Flow
+
+Every escrow action goes through Nostr. The contract never talks to Nostr directly — the daemon bridges them.
+
+```
+AGENT                        NOSTR                        DAEMON                       NEAR ON-CHAIN
+  │                            │                            │                             │
+  │ 1. Sign CreateEscrow       │                            │                             │
+  │    + FundEscrow            │                            │                             │
+  │                            │                            │                             │
+  │ 2. POST kind 41000 ───────►│                            │                             │
+  │    tags: action, sig,      │                            │                             │
+  │    fund_action, fund_sig,  │                            │                             │
+  │    agent (msig),           │                            │                             │
+  │    description, reward     │                            │                             │
+  │                            │ 3. Relayer ◄──────────────│                             │
+  │                            │    subscribes to 41000     │                             │
+  │                            │                            │ 4. Extract actions + msig   │
+  │                            │                            │                             │
+  │                            │                            │ 5. msig.execute() ─────────►│
+  │                            │                            │    (action_json + sig)      │
+  │                            │                            │                             │
+  │                            │                            │               create_escrow()├──►│ PendingFunding
+  │                            │                            │               fund_escrow()  ├──►│ Open
+  │                            │                            │                             │
+  │                            │ 6. Worker ◄───────────────│                             │
+  │                            │    sees same 41000         │                             │
+  │                            │                            │ 7. poll_until_open() ──────►│
+  │                            │                            │ 8. claim() ────────────────►│ InProgress
+  │                            │                            │                             │
+  │                            │                            │ 9. Execute WASM             │
+  │                            │                            │                             │
+  │                            │                            │ 10. Write result to KV ────►│
+  │                            │                            │                             │
+  │                            │                            │ 11. submit_result() ───────►│ Verifying (YIELDS)
+  │                            │                            │    {kv_account, kv_key}     │
+  │                            │                            │                             │
+  │                            │                            │ ─── ~200 block timeout ──── │
+  │                            │                            │                             │
+  │                            │                            │ 12. Verifier polls ────────►│
+  │                            │                            │     list_verifying()        │
+  │                            │                            │                             │
+  │                            │                            │ 13. Fetch result from KV    │
+  │                            │                            │     (HTTP GET fastnear)     │
+  │                            │                            │                             │
+  │                            │                            │ 14. Score via Gemini API    │
+  │                            │                            │     (4 passes, median)      │
+  │                            │                            │                             │
+  │                            │                            │ 15. resume_verification() ─►│
+  │                            │                            │     {score, passed}         │
+  │                            │                            │                             │
+  │                            │                            │            settlement_cb()──├──►│
+  │                            │                            │            ft_transfer()   ├──►│ worker paid
+  │                            │                            │                             │
+  │                            │ 16. POST kind 41005 ◄─────│                             │
+  │ 17. Agent sees 41005 ◄────│    (confirmed)             │                             │
+```
+
+## Nostr Event Kinds
+
+| Kind | Name | Who Sends | Tags |
+|------|------|-----------|------|
+| 41000 | TASK | Agent | action, action_sig, fund_action, fund_action_sig, agent, description, reward |
+| 41001 | CLAIM | Worker | job_id, worker_account |
+| 41002 | RESULT | Worker | job_id, kv_reference |
+| 41003 | ACTION | Agent | action, action_sig, agent |
+| 41004 | DISPATCHED | Daemon | job_id, wasm_url |
+| 41005 | CONFIRMED | Daemon | job_id, score, passed |
+
+Legacy kinds 7200-7205 supported for backwards compatibility.
 
 ## Components
 
-| Component | Description |
-|-----------|-------------|
-| `contract/` | Minimal NEAR job-queue contract (~650 lines) |
-| `worker/` | WASM execution engine + daemon (polls contract, executes, resolves) |
-| `examples/` | Example WASI P2 programs (rpc-test, test-storage) |
+| Component | Path | Description |
+|-----------|------|-------------|
+| Job Queue Contract | `contract/` | NEAR contract for direct mode (~650 lines) |
+| Daemon | `worker/src/daemon/` | WASM execution + escrow bridge |
+| escrow_client.rs | `worker/src/daemon/escrow_client.rs` | claim, submit_result, write_kv, run_escrow_job |
+| escrow_commands.rs | `worker/src/daemon/escrow_commands.rs` | CLI subcommands + thread spawners |
+| nostr.rs | `worker/src/daemon/nostr.rs` | Nostr pub/sub (kind 41000-41005) |
+| manage.rs | `worker/src/daemon/manage.rs` | DaemonConfig (execution_mode, escrow fields) |
+| nonce.rs | `worker/src/daemon/nonce.rs` | NonceCache for tx sequencing |
+| mod.rs | `worker/src/daemon/mod.rs` | Main loop + event routing |
+| inlayer.rs | `worker/src/bin/inlayer.rs` | CLI entry point |
+| Examples | `examples/` | WASI P2 programs (rpc-test, test-storage) |
+
+## Execution Modes
+
+| Mode | Config Value | What Runs |
+|------|-------------|-----------|
+| Direct | `execution_mode = "direct"` | Worker only — polls job-queue contract |
+| Escrow | `execution_mode = "escrow"` | Worker + relayer + verifier threads |
+| Both | `execution_mode = "both"` | Direct + escrow threads |
 
 ## Quick Start
 
-### 1. Run WASM locally
+### Build
 ```bash
-# Build worker
 cd worker && cargo build --release --bin inlayer
-
-# List available WASMs
-./target/release/inlayer list
-
-# Run locally
-./target/release/inlayer run <wasm-path> '{"action":"test"}'
 ```
 
-### 2. Deploy contract & run daemon
+### Configure
 ```bash
-# Deploy contract to testnet
-cd contract && cargo near deploy build non-reproducible-wasm <account-id> testnet
-
-# Configure daemon
-inlayer init  # creates inlayer.config
-
-# Start daemon (polls contract, executes jobs, resolves on-chain)
-inlayer daemon --foreground --dashboard 127.0.0.1:8082
+./target/release/inlayer init  # creates inlayer.config
 ```
 
-### 3. Submit a job
+Edit `inlayer.config`:
+```toml
+# Core
+contract_id = "inlayer.testnet"
+account_id = "daemon.testnet"
+key_path = "~/.near-credentials/testnet/daemon.testnet.json"
+
+# RPC
+rpc_url = "https://rpc.testnet.near.org"
+
+# Nostr signaling
+nostr_relay = "wss://nostr-relay-production.up.railway.app"
+nostr_nsec = "nsec1..."
+
+# Execution mode: "direct" | "escrow" | "both"
+execution_mode = "escrow"
+
+# Escrow fields (required for escrow/both)
+escrow_contract = "escrow.kampouse.testnet"
+kv_account = "kv.kampouse.near"
+worker_stake_yocto = 1000000000000000000000000  # 1 NEAR
+
+# Timing
+escrow_fund_timeout_secs = 60
+escrow_settle_timeout_secs = 120
+```
+
+### Run
 ```bash
-inlayer submit '{"action":"test"}' --wasm-url <url> <sha256>
+# Foreground (development)
+./target/release/inlayer daemon --foreground
+
+# As daemon (production)
+./target/release/inlayer daemon --start
+
+# With web dashboard
+./target/release/inlayer daemon --foreground --dashboard 127.0.0.1:8082
 ```
 
-## Contract API
+When `execution_mode = "escrow"` or `"both"`, the daemon auto-spawns relayer + verifier threads. No separate processes needed.
+
+## CLI Commands
+
+```
+# Daemon management
+inlayer daemon --start                              Start via launchd
+inlayer daemon --stop                               Stop
+inlayer daemon --status                             Check if running
+inlayer daemon --log                                Tail logs
+inlayer daemon --foreground                         Run in foreground
+inlayer daemon --foreground --dashboard 127.0.0.1   With web dashboard
+
+# Escrow commands
+inlayer post-task --nostr-key <nsec> --agent-key <ed25519:hex> \
+  --msig <account> --escrow <contract> --job-id <id> \
+  --description "task description" --reward "1" \
+  --rpc https://rpc.testnet.near.org
+
+inlayer relayer [--dry-run]                         Standalone relayer (debug)
+inlayer verifier [--once]                           Standalone verifier (debug)
+
+# Direct mode
+inlayer submit '{\"action\":\"test\"}' --wasm-url <url> <sha256>
+inlayer run <wasm-path> '{\"action\":\"test\"}'     Local WASM execution
+inlayer exec --worker <url> --input <data>          Remote execution
+inlayer ping --worker <url>                         Check worker status
+
+# Utility
+inlayer list                                       List available WASMs
+inlayer config                                     Show current config
+inlayer version                                    Show version
+```
+
+## System Links
+
+| Service | URL | Purpose |
+|---------|-----|---------|
+| NEAR Testnet RPC | `https://rpc.testnet.near.org` | JSON-RPC endpoint |
+| NEAR Mainnet RPC | `https://rpc.mainnet.near.org` | JSON-RPC endpoint |
+| FastNear KV Read | `https://kv.main.fastnear.com/v0/latest/{account}/{predecessor}/{key}` | Read stored results |
+| FastNear KV Write | RPC call `__fastdata_kv` to any account | Write results via tx |
+| Nostr Relay | `wss://nostr-relay-production.up.railway.app` | Event discovery |
+| Gemini API | `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash` | LLM scoring |
+| NEAR Explorer (Testnet) | `https://testnet.nearblocks.io` | Block/tx explorer |
+| NEAR Explorer (Mainnet) | `https://nearblocks.io` | Block/tx explorer |
+
+## Environment Variables
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `GEMINI_API_KEY` | Escrow mode | LLM scoring for verifier thread |
+| `NEAR_PRIVATE_KEY` | Alternative | If key_path not set in config |
+| `INLAYER_NETWORK` | Optional | testnet/mainnet |
+| `INLAYER_ACCOUNT` | Optional | Override account_id |
+| `INLAYER_CONTRACT` | Optional | Override contract_id |
+
+## Daemon File Structure
+
+```
+worker/src/daemon/
+├── mod.rs               # Main loop, handle_nostr_dispatch router
+│                        #   - execution_mode router: direct / escrow / both
+│                        #   - spawns relayer + verifier threads on startup
+│                        #   - send_function_call() for on-chain txs
+│
+├── escrow_client.rs     # Escrow interaction functions
+│                        #   - get_escrow()        → view escrow state
+│                        #   - poll_until_open()   → retry until funded
+│                        #   - claim()             → claim for worker
+│                        #   - submit_result()     → submit + triggers yield
+│                        #   - write_kv()          → write to FastNear KV
+│                        #   - wait_for_settlement() → poll until settled
+│                        #   - run_escrow_job()    → full claim→execute→submit
+│
+├── escrow_commands.rs   # CLI subcommands + daemon thread spawners
+│                        #   - cmd_post_task()     → sign + post to Nostr
+│                        #   - cmd_relayer()       → CLI wrapper
+│                        #   - cmd_verifier()      → CLI wrapper
+│                        #   - spawn_relayer_thread()  → daemon thread
+│                        #   - spawn_verifier_thread() → daemon thread
+│                        #   - run_relayer_inner()     → relayer loop
+│                        #   - run_verifier_cycle()    → verifier loop
+│
+├── nostr.rs             # Nostr integration
+│                        #   - kind 41000-41005 constants
+│                        #   - spawn_nostr_subscriber()
+│                        #   - publish_event()
+│                        #   - legacy 72xx kinds
+│
+├── manage.rs            # DaemonConfig
+│                        #   - execution_mode: "direct" | "escrow" | "both"
+│                        #   - escrow_contract, kv_account, worker_stake_yocto
+│                        #   - fund_timeout, settle_timeout
+│                        #   - load(), rpc_url()
+│
+└── nonce.rs             # NonceCache for tx sequencing
+```
+
+## Job Queue Contract API (Direct Mode)
 
 ```rust
 // Submit a job (payable)
@@ -60,89 +308,51 @@ get_pricing()
 estimate_execution_cost(resource_limits)
 ```
 
-## Daemon Commands
-```bash
-inlayer daemon --start          # Start via launchd
-inlayer daemon --stop           # Stop
-inlayer daemon --status         # Check if running
-inlayer daemon --log            # Tail logs
-inlayer daemon --foreground     # Run in foreground (for testing)
-inlayer daemon --dashboard 127.0.0.1:8082  # Enable web dashboard
-inlayer daemon --tunnel         # Cloudflare tunnel for public access
-```
+## Host Functions (available to WASM)
 
-## Full CLI
-```
-inlayer run <wasm> <input> [--rpc <url>]    Run WASM locally
-inlayer exec --worker <url> --input <data>  Execute on remote worker
-inlayer submit <input> [--wasm-url <url>]   Submit request to contract
-inlayer daemon [...]                         Start/manage daemon
-inlayer ping --worker <url>                 Check worker status
-inlayer list                                List available WASMs
-inlayer config                              Show current config
-inlayer version                             Show version
-```
-
-## Configuration
-`inlayer init` creates `inlayer.config`:
-```toml
-search_paths = ["./wasm"]
-
-[rpc]
-url = "https://rpc.testnet.near.org"
-
-[storage]
-mode = "local"
-dir = "./storage"
-
-[runner]
-max_instructions = 10000000000
-max_memory_mb = 256
-max_execution_seconds = 60
-```
-
-## Environment Variables
-- `INLAYER_NETWORK` — testnet/mainnet
-- `INLAYER_ACCOUNT` — NEAR account for daemon
-- `INLAYER_CONTRACT` — contract account ID
-- `NEAR_PRIVATE_KEY` — signer key
-
-## Payment Flow (Remote Exec)
-1. `exec` sends request to worker API
-2. Worker returns 402 with payment challenge
-3. Client pays via NEAR Intents
-4. Client retries with payment receipt
-5. Worker verifies on-chain, executes WASM, returns result
+- **RPC Proxy** — make NEAR RPC calls (query, tx, view_account, etc.)
+- **Storage** — persistent key-value storage (put/get/delete/increment)
 
 ## Examples
 
 ### test-storage
-Persistent storage operations (set/get/increment):
 ```bash
 cd examples/test-storage && cargo build --target wasm32-wasip2 --release
 inlayer run target/wasm32-wasip2/release/test-storage-ark.wasm '{"command":"set","key":"hello","value":"world"}'
-inlayer run target/wasm32-wasip2/release/test-storage-ark.wasm '{"command":"get","key":"hello"}'
 ```
 
 ### rpc-test
-Tests all NEAR RPC methods through the proxy:
 ```bash
 cd examples/rpc-test && cargo build --target wasm32-wasip2 --release
 inlayer run target/wasm32-wasip2/release/rpc-test-ark.wasm '{"action":"view_account","account_id":"test.near"}'
 ```
 
-## Host Functions (available to WASM)
-- **RPC Proxy** — make NEAR RPC calls (query, tx, view_account, etc.)
-- **Storage** — persistent key-value storage (put/get/delete/increment)
-- ~~Wallet~~ — removed in standalone
-- ~~VRF~~ — removed in standalone
-- ~~Payment~~ — removed in standalone
+## Build
 
-## Build from Source
 ```bash
-# Contract
-cd contract && cargo near build non-reproducible-wasm
-
-# Worker
+# Daemon binary
 cd worker && cargo build --release --bin inlayer
+
+# Job queue contract
+cd contract && cargo near build non-reproducible-wasm
 ```
+
+## Test
+
+```bash
+cd worker && cargo test  # 17 tests
+```
+
+## Key Design Decisions
+
+- Daemon is dumb pipe — routes tasks, handles KV writes, submits results. No business logic.
+- One process, three threads (relayer + worker + verifier). No separate processes to manage.
+- Nostr is discovery only — contracts don't know about it.
+- FastNear KV for large results — small KV reference on-chain, full data off-chain.
+- Verifier thread is optional — skips if GEMINI_API_KEY not set.
+- CLI subcommands (relayer, verifier) still work standalone for debugging.
+- escrow_client.rs is bridge code — works with any escrow contract, no inlayer internals leak.
+
+## License
+
+MIT
