@@ -58,6 +58,12 @@ pub struct EscrowView {
     pub task_description: String,
     pub criteria: String,
     pub result: Option<String>,
+    #[serde(default = "default_threshold")]
+    pub score_threshold: u8,
+}
+
+fn default_threshold() -> u8 {
+    80
 }
 
 // ── KV reference (stored in escrow result field) ────────────────────────

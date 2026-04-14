@@ -458,16 +458,17 @@ fn run_verifier_cycle(
             }
         };
 
-        // 3. Score with Gemini
+        // 3. Score with Gemini (multi-pass, uses escrow's own threshold)
+        let threshold = escrow.score_threshold;
         let score = score_with_gemini(
             gemini_key,
             &escrow.task_description,
             &escrow.criteria,
             &result_content,
-            80, // threshold
+            threshold,
         )?;
 
-        let passed = score.score >= 80;
+        let passed = score.score >= threshold;
         let verdict = Verdict {
             score: score.score,
             passed,
@@ -541,23 +542,61 @@ struct GeminiScore {
     detail: String,
 }
 
-/// Score a task result using Google Gemini API.
-fn score_with_gemini(
-    api_key: &str,
+/// Single-pass scoring result.
+#[derive(Debug)]
+struct PassResult {
+    score: u8,
+    reasoning: String,
+}
+
+/// Build the scoring prompt. Same prompt for all passes — temperature variation provides diversity.
+fn build_scoring_prompt(
     task_description: &str,
     criteria: &str,
     result: &str,
     threshold: u8,
-) -> Result<GeminiScore> {
-    let prompt = format!(
-        "You are an expert task verifier. Score the following work result against the criteria.\n\n\
-         Task: {}\n\n\
-         Criteria: {}\n\n\
-         Result: {}\n\n\
-         Score threshold: {}/100\n\n\
-         Respond with ONLY valid JSON: {{\"score\": <number 0-100>, \"reasoning\": \"<brief explanation>\"}}",
-        task_description, criteria, result, threshold
-    );
+) -> String {
+    format!(
+        r#"You are an impartial work verifier. Score the following work result against the given criteria.
+
+## Task Description
+{task_description}
+
+## Acceptance Criteria
+{criteria}
+
+## Work Result
+{result}
+
+## Instructions
+1. Carefully evaluate the work result against each criterion.
+2. Score from 0 to 100, where:
+   - 0-20: Completely fails to address the task
+   - 21-40: Addresses some aspects but major gaps
+   - 41-60: Partially meets criteria, significant issues remain
+   - 61-80: Mostly meets criteria, minor issues
+   - 81-100: Fully meets or exceeds all criteria
+3. The passing threshold is {threshold}/100.
+4. Be strict. Do not give partial credit for incomplete work.
+
+Respond in JSON format:
+{{"score": <number 0-100>, "reasoning": "<detailed explanation of the score, addressing each criterion>"}}"#,
+        task_description = task_description,
+        criteria = criteria,
+        result = result,
+        threshold = threshold,
+    )
+}
+
+/// Run a single Gemini scoring pass. Returns (score, reasoning).
+fn gemini_single_pass(
+    api_key: &str,
+    prompt: &str,
+    pass_num: usize,
+) -> Result<PassResult> {
+    // Temperature ramps slightly per pass for diversity: 0.2, 0.3, 0.4, 0.5
+    let temperature = 0.2 + (pass_num as f32 * 0.1);
+    let temperature = temperature.min(0.5);
 
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
@@ -569,13 +608,14 @@ fn score_with_gemini(
             "parts": [{ "text": prompt }]
         }],
         "generationConfig": {
-            "temperature": 0.3,
+            "temperature": temperature,
             "responseMimeType": "application/json"
         }
     });
 
     let client = reqwest::blocking::Client::new();
-    let resp = client.post(&url)
+    let resp = client
+        .post(&url)
         .json(&body)
         .timeout(Duration::from_secs(30))
         .send()
@@ -595,10 +635,69 @@ fn score_with_gemini(
         .unwrap_or("{}");
 
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
-    let score = parsed["score"].as_u64().unwrap_or(0) as u8;
-    let detail = parsed["reasoning"].as_str().unwrap_or("no reasoning").to_string();
+    let score = (parsed["score"].as_u64().unwrap_or(0) as u8).min(100);
+    let reasoning = parsed["reasoning"]
+        .as_str()
+        .unwrap_or("no reasoning")
+        .to_string();
 
-    Ok(GeminiScore { score, detail })
+    Ok(PassResult { score, reasoning })
+}
+
+/// Multi-pass scoring: run N independent Gemini calls, take median score.
+/// Uses temperature variation across passes for robustness.
+fn score_with_gemini(
+    api_key: &str,
+    task_description: &str,
+    criteria: &str,
+    result: &str,
+    threshold: u8,
+) -> Result<GeminiScore> {
+    let num_passes = 4;
+    let prompt = build_scoring_prompt(task_description, criteria, result, threshold);
+
+    let mut pass_results: Vec<PassResult> = Vec::with_capacity(num_passes);
+
+    for i in 0..num_passes {
+        match gemini_single_pass(api_key, &prompt, i) {
+            Ok(pr) => {
+                eprintln!("  pass {}/{}: score={}", i + 1, num_passes, pr.score);
+                pass_results.push(pr);
+            }
+            Err(e) => {
+                eprintln!("  pass {}/{} FAILED: {}", i + 1, num_passes, e);
+                pass_results.push(PassResult {
+                    score: 0,
+                    reasoning: format!("Error: {}", e),
+                });
+            }
+        }
+    }
+
+    // Median of scores
+    let mut scores: Vec<u8> = pass_results.iter().map(|p| p.score).collect();
+    scores.sort();
+    let median_score = scores[scores.len() / 2];
+
+    // Pick the pass closest to median for reasoning
+    let fallback = PassResult {
+        score: 0,
+        reasoning: "no passes completed".into(),
+    };
+    let best_pass = pass_results
+        .iter()
+        .min_by_key(|p| (p.score as i16 - median_score as i16).abs() as u8)
+        .unwrap_or(&fallback);
+
+    let detail = format!(
+        "Median of {} passes: {}/100. Threshold: {}. Best reasoning: {}",
+        num_passes, median_score, threshold, best_pass.reasoning
+    );
+
+    Ok(GeminiScore {
+        score: median_score,
+        detail,
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════════
