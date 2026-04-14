@@ -806,7 +806,7 @@ fn run_relayer_inner(
             "signature": sig_bytes,
         });
 
-        match super::send_function_call(
+        let create_tx = match super::send_function_call(
             rpc_url, signer, &msig, "execute", &execute_args,
             300_000_000_000_000,
             0,
@@ -814,11 +814,13 @@ fn run_relayer_inner(
         ) {
             Ok((tx_hash, _)) => {
                 eprintln!("[relayer]   submitted ✓ tx={}", &tx_hash[..16.min(tx_hash.len())]);
+                tx_hash
             }
             Err(e) => {
                 eprintln!("[relayer]   submit FAILED: {}", e);
+                continue;
             }
-        }
+        };
 
         // Heartbeat
         if let Some(h) = health {
@@ -857,6 +859,31 @@ fn run_relayer_inner(
                 ) {
                     Ok((tx_hash, _)) => {
                         eprintln!("[relayer]   fund submitted ✓ tx={}", &tx_hash[..16.min(tx_hash.len())]);
+
+                        // Publish kind 41004 (FUNDED) — signals workers that escrow is ready to claim
+                        if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
+                            let job_id_tag = event.tags.iter()
+                                .find(|t| t.len() >= 2 && t[0] == "job_id")
+                                .and_then(|t| t.get(1))
+                                .map(|s| s.clone())
+                                .unwrap_or_else(|| "unknown".into());
+                            let funded_content = serde_json::json!({
+                                "job_id": job_id_tag,
+                                "escrow_status": "Open",
+                                "create_tx": &create_tx,
+                                "fund_tx": &tx_hash[..16.min(tx_hash.len())],
+                            });
+                            let funded_str = serde_json::to_string(&funded_content).unwrap_or_default();
+                            let funded_tags = vec![
+                                vec!["e".into(), event.id.clone()],
+                                vec!["p".into(), event.pubkey.clone()],
+                                vec!["job_id".into(), job_id_tag],
+                            ];
+                            match super::nostr::publish_event(relay, nsec, super::nostr::KIND_DISPATCH, &funded_str, funded_tags) {
+                                Ok(()) => eprintln!("[relayer]   published 41004 (FUNDED) ✓"),
+                                Err(e) => eprintln!("[relayer]   failed to publish 41004: {}", e),
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("[relayer]   fund submit FAILED: {}", e);

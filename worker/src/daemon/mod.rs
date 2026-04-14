@@ -816,6 +816,66 @@ fn handle_nostr_result_escrow(
 
     log(&format!("   [escrow] agent result for job_id={} ({} bytes)", job_id, result_output.len()));
 
+    // Extract worker msig data from tags (optional — fallback to daemon signer)
+    let worker_claim = {
+        let worker_msig = event.tags.iter()
+            .find(|t| t.len() >= 2 && t[0] == "worker_msig")
+            .and_then(|t| t.get(1))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        let claim_action_json = event.tags.iter()
+            .find(|t| t.len() >= 2 && t[0] == "claim_action")
+            .and_then(|t| t.get(1))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        let claim_sig_hex = event.tags.iter()
+            .find(|t| t.len() >= 2 && t[0] == "claim_sig")
+            .and_then(|t| t.get(1))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        let submit_action_json = event.tags.iter()
+            .find(|t| t.len() >= 2 && t[0] == "submit_action")
+            .and_then(|t| t.get(1))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        let submit_sig_hex = event.tags.iter()
+            .find(|t| t.len() >= 2 && t[0] == "submit_sig")
+            .and_then(|t| t.get(1))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        if !worker_msig.is_empty() && !claim_action_json.is_empty() && !claim_sig_hex.is_empty()
+            && !submit_action_json.is_empty() && !submit_sig_hex.is_empty()
+        {
+            let claim_sig_bytes = match hex::decode(claim_sig_hex) {
+                Ok(b) if b.len() == 64 => b,
+                Ok(b) => { log(&format!("   [escrow] claim_sig wrong length: {} bytes (expected 64)", b.len())); return; }
+                Err(e) => { log(&format!("   [escrow] claim_sig hex decode failed: {}", e)); return; }
+            };
+            let submit_sig_bytes = match hex::decode(submit_sig_hex) {
+                Ok(b) if b.len() == 64 => b,
+                Ok(b) => { log(&format!("   [escrow] submit_sig wrong length: {} bytes (expected 64)", b.len())); return; }
+                Err(e) => { log(&format!("   [escrow] submit_sig hex decode failed: {}", e)); return; }
+            };
+
+            log(&format!("   [escrow] worker msig={}, signed claim+submit ✓", worker_msig));
+            Some(escrow_client::WorkerMsigClaim {
+                worker_msig: worker_msig.to_string(),
+                claim_action_json: claim_action_json.to_string(),
+                claim_sig_bytes,
+                submit_action_json: submit_action_json.to_string(),
+                submit_sig_bytes,
+            })
+        } else {
+            log("   [escrow] no worker msig tags — using daemon signer fallback");
+            None
+        }
+    };
+
     // Build RPC pool for view calls
     let rpc = match rpc_pool::Rpc::new(rpc_url) {
         Ok(r) => r,
@@ -833,6 +893,7 @@ fn handle_nostr_result_escrow(
         daemon_cfg.worker_stake_yocto,
         nonce_cache,
         result_output,
+        worker_claim.as_ref(),
     );
 
     match result {

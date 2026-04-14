@@ -50,10 +50,11 @@ The daemon is a dumb pipe — it routes tasks and handles on-chain plumbing (cla
 
          ┌──────────────────┐  ┌──────────────────┐
          │  Task Agent      │  │  Worker Agent    │
-         │  (posts 41000)   │  │  (external AI)   │
-         │                  │  │  sees 41000,     │
+         │  (posts 41000)   │  │  (has own msig)  │
+         │                  │  │  sees 41004,     │
          │  creates escrow  │  │  does work,      │
-         │  on-chain        │  │  posts 41002     │
+         │  on-chain        │  │  signs claim,    │
+         │                  │  │  posts 41002     │
          └──────────────────┘  └──────────────────┘
 ```
 
@@ -83,46 +84,61 @@ TASK AGENT                     NOSTR                        DAEMON              
   │                            │                            │               fund_escrow()  ├──►│ Open
   │                            │                            │                             │
 
-WORKER AGENT (external AI)     │                            │                             │
+WORKER AGENT (has own msig)     │                            │                             │
   │                            │                            │                             │
   │ 6. See kind 41000 ◄───────│                            │                             │
   │    (task available)        │                            │                             │
   │                            │                            │                             │
-  │ 7. Do actual work off-chain│                            │                             │
+  │                            │ 6b. POST kind 41004 ◄─────│                             │
+  │                            │    (FUNDED — escrow Open)  │                             │
+  │                            │                            │                             │
+  │ 7. See 41004 → escrow is   │                            │                             │
+  │    funded → safe to claim  │                            │                             │
+  │                            │                            │                             │
+  │ 8. Do actual work off-chain│                            │                             │
   │    (NOT the daemon)        │                            │                             │
   │                            │                            │                             │
-  │ 8. POST kind 41002 ───────►│                            │                             │
-  │    {job_id, result/output} │                            │                             │
+  │ 9. Pre-sign claim() and    │                            │                             │
+  │    submit_result() with    │                            │                             │
+  │    worker msig key         │                            │                             │
   │                            │                            │                             │
-  │                            │ 9. Plumbing thread ◄──────│                             │
+  │ 10. POST kind 41002 ──────►│                            │                             │
+  │    tags: job_id, result,   │                            │                             │
+  │    worker_msig,            │                            │                             │
+  │    claim_action, claim_sig,│                            │                             │
+  │    submit_action,submit_sig│                            │                             │
+  │                            │                            │                             │
+  │                            │ 11. Plumbing thread ◄─────│                             │
   │                            │    sees 41002              │                             │
-  │                            │                            │ 10. poll_until_open() ─────►│
-  │                            │                            │ 11. claim() ────────────────►│ InProgress
   │                            │                            │                             │
-  │                            │                            │ 12. Write result to KV ────►│
+  │                            │                            │ 12. worker_msig.execute()──►│ InProgress
+  │                            │                            │     (claim via worker msig) │ worker stakes own funds
   │                            │                            │                             │
-  │                            │                            │ 13. submit_result() ───────►│ Verifying (YIELDS)
-  │                            │                            │    {kv_account, kv_key}     │
+  │                            │                            │ 13. Write result to KV ────►│ (daemon signer, FastNear)
+  │                            │                            │                             │
+  │                            │                            │ 14. worker_msig.execute()──►│ Verifying (YIELDS)
+  │                            │                            │     (submit_result via      │
+  │                            │                            │      worker msig)           │
   │                            │                            │                             │
   │                            │                            │ ─── ~200 block timeout ──── │
   │                            │                            │                             │
-  │                            │                            │ 14. Verifier polls ────────►│
+  │                            │                            │ 15. Verifier polls ────────►│
   │                            │                            │     list_verifying()        │
   │                            │                            │                             │
-  │                            │                            │ 15. Fetch result from KV    │
+  │                            │                            │ 16. Fetch result from KV    │
   │                            │                            │     (HTTP GET fastnear)     │
   │                            │                            │                             │
-  │                            │                            │ 16. Score via Gemini API    │
+  │                            │                            │ 17. Score via Gemini API    │
   │                            │                            │     (4 passes, median)      │
   │                            │                            │                             │
-  │                            │                            │ 17. resume_verification() ─►│
+  │                            │                            │ 18. resume_verification() ─►│
   │                            │                            │     {score, passed}         │
   │                            │                            │                             │
   │                            │                            │            settlement_cb()──├──►│
-  │                            │                            │            ft_transfer()   ├──►│ worker paid
+  │                            │                            │            ft_transfer()   ├──►│ worker_msig paid
   │                            │                            │                             │
-  │                            │ 18. POST kind 41005 ◄─────│                             │
-  │ 19. Agent sees 41005 ◄────│    (confirmed)             │                             │
+  │                            │ 19. POST kind 41005 ◄─────│                             │
+  │ 20. Worker sees 41005 ◄───│    (confirmed)             │                             │
 ```
 
 ## Nostr Event Kinds
@@ -131,7 +147,7 @@ WORKER AGENT (external AI)     │                            │               
 |------|------|-----------|------|
 | 41000 | TASK | Task Agent | action, action_sig, fund_action, fund_action_sig, agent, description, reward |
 | 41001 | CLAIM | Daemon (plumbing) | job_id, worker_account |
-| 41002 | RESULT | Worker Agent (external AI) | job_id, result/output |
+| 41002 | RESULT | Worker Agent (has own msig) | job_id, result/output, worker_msig, claim_action, claim_sig, submit_action, submit_sig |
 | 41003 | ACTION | Task Agent | action, action_sig, agent |
 | 41004 | DISPATCHED | Daemon (relayer) | job_id, escrow_id |
 | 41005 | CONFIRMED | Daemon (verifier) | job_id, score, passed |

@@ -173,6 +173,38 @@ pub fn claim(
     )
 }
 
+/// Claim an open escrow via worker's multisig.
+/// The worker pre-signs the claim action, daemon relays it via msig.execute().
+/// The worker's msig becomes the worker on-chain — real skin in the game.
+pub fn claim_via_msig(
+    rpc_url: &str,
+    daemon_signer: &InMemorySigner,
+    worker_msig: &str,
+    claim_action_json: &str,
+    claim_sig_bytes: &[u8],
+    nonce_cache: &NonceCache,
+) -> Result<(String, Option<serde_json::Value>)> {
+    tracing::info!(
+        "[escrow] claiming via worker msig {} ({} byte action)",
+        worker_msig,
+        claim_action_json.len()
+    );
+    let execute_args = serde_json::json!({
+        "action_json": claim_action_json,
+        "signature": claim_sig_bytes,
+    });
+    send_function_call(
+        rpc_url,
+        daemon_signer,
+        worker_msig,
+        "execute",
+        &execute_args,
+        GAS_CLAIM,
+        0, // deposit already in the signed action
+        nonce_cache,
+    )
+}
+
 /// Submit a result to the escrow contract.
 /// The `result` string is stored on-chain and triggers yield/resume verification.
 /// For KV-based results, pass the KvReference JSON here.
@@ -201,6 +233,38 @@ pub fn submit_result(
         &args,
         GAS_SUBMIT_RESULT,
         0, // no deposit
+        nonce_cache,
+    )
+}
+
+/// Submit a result via worker's multisig.
+/// The worker pre-signs the submit_result action (with deterministic kv_reference),
+/// daemon relays it via msig.execute(). Worker's msig is the caller on-chain.
+pub fn submit_result_via_msig(
+    rpc_url: &str,
+    daemon_signer: &InMemorySigner,
+    worker_msig: &str,
+    submit_action_json: &str,
+    submit_sig_bytes: &[u8],
+    nonce_cache: &NonceCache,
+) -> Result<(String, Option<serde_json::Value>)> {
+    tracing::info!(
+        "[escrow] submitting result via worker msig {} ({} byte action)",
+        worker_msig,
+        submit_action_json.len()
+    );
+    let execute_args = serde_json::json!({
+        "action_json": submit_action_json,
+        "signature": submit_sig_bytes,
+    });
+    send_function_call(
+        rpc_url,
+        daemon_signer,
+        worker_msig,
+        "execute",
+        &execute_args,
+        GAS_SUBMIT_RESULT,
+        0,
         nonce_cache,
     )
 }
@@ -300,15 +364,32 @@ pub struct EscrowJobResult {
     pub tx_hash_kv: String,
 }
 
-/// Run the full escrow job lifecycle:
+/// Pre-signed worker msig actions for claim + submit_result.
+/// The worker agent creates these offline and posts them in the kind 41002 event tags.
+/// The daemon relays both via msig.execute() — worker's msig is the caller on-chain.
+pub struct WorkerMsigClaim {
+    /// Worker's msig account ID (e.g. "worker.v1.test.near")
+    pub worker_msig: String,
+    /// Pre-signed claim() action JSON
+    pub claim_action_json: String,
+    /// Ed25519 signature of the claim action (64 bytes)
+    pub claim_sig_bytes: Vec<u8>,
+    /// Pre-signed submit_result() action JSON (with deterministic kv_reference)
+    pub submit_action_json: String,
+    /// Ed25519 signature of the submit action (64 bytes)
+    pub submit_sig_bytes: Vec<u8>,
+}
+
+/// Run the full escrow job lifecycle via worker's multisig:
 ///   1. Poll until Open (funded)
-///   2. Claim (put up stake)
-///   3. Write result to FastNear KV
-///   4. Submit KV reference to escrow contract
+///   2. Claim via worker_msig.execute() — worker's own funds at stake
+///   3. Write result to FastNear KV (daemon's signer — not the escrow contract)
+///   4. Submit KV reference via worker_msig.execute()
 ///   5. Wait for verification + settlement
 ///
-/// The actual work is done by the external agent — it posts the result via Nostr (kind 41002).
-/// The daemon only handles the on-chain plumbing.
+/// The worker pre-signs both claim and submit_result actions with deterministic args.
+/// The kv_reference is known at sign time: `{"account": kv_account, "key": "result/{job_id}"}`.
+/// Settlement pays the worker's msig directly.
 pub fn run_escrow_job(
     rpc: &rpc_pool::Rpc,
     rpc_url: &str,
@@ -319,6 +400,7 @@ pub fn run_escrow_job(
     stake_yocto: u128,
     nonce_cache: &NonceCache,
     result_output: &str,
+    worker_claim: Option<&WorkerMsigClaim>,
 ) -> Result<EscrowJobResult> {
     // 1. Poll until Open
     let _escrow = poll_until_open(
@@ -328,40 +410,69 @@ pub fn run_escrow_job(
         Duration::from_secs(600), // 10 min timeout for funding
     )?;
 
-    // 2. Claim
-    let (tx_hash_claim, _) = claim(
-        rpc_url,
-        signer,
-        escrow_contract,
-        job_id,
-        stake_yocto,
-        nonce_cache,
-    )?;
-    tracing::info!("[escrow] {} claimed ✓ tx={}", job_id, tx_hash_claim);
+    // 2. Claim — via worker msig (preferred) or daemon signer (fallback)
+    let tx_hash_claim = if let Some(claim) = worker_claim {
+        let (tx, _) = claim_via_msig(
+            rpc_url,
+            signer,
+            &claim.worker_msig,
+            &claim.claim_action_json,
+            &claim.claim_sig_bytes,
+            nonce_cache,
+        )?;
+        tracing::info!("[escrow] {} claimed via worker msig {} ✓ tx={}", job_id, claim.worker_msig, tx);
+        tx
+    } else {
+        let (tx, _) = claim(
+            rpc_url,
+            signer,
+            escrow_contract,
+            job_id,
+            stake_yocto,
+            nonce_cache,
+        )?;
+        tracing::info!("[escrow] {} claimed (daemon signer) ✓ tx={}", job_id, tx);
+        tx
+    };
 
-    // 3. Write result to KV
+    // 3. Write result to KV — always daemon's signer (FastNear, not escrow contract)
     let kv_key = format!("result/{}", job_id);
     let tx_hash_kv = write_kv(rpc_url, signer, kv_account, &kv_key, result_output, nonce_cache)?;
 
-    // 4. Submit KV reference to escrow
+    // 4. Submit KV reference — via worker msig (preferred) or daemon signer (fallback)
     let kv_ref = KvReference {
         kv_account: kv_account.to_string(),
-        kv_predecessor: signer.account_id.to_string(),
+        kv_predecessor: if let Some(claim) = worker_claim {
+            claim.worker_msig.clone()
+        } else {
+            signer.account_id.to_string()
+        },
         kv_key,
     };
-    let (tx_hash_result, _) = submit_result(
-        rpc_url,
-        signer,
-        escrow_contract,
-        job_id,
-        &kv_ref.to_json(),
-        nonce_cache,
-    )?;
-    tracing::info!(
-        "[escrow] {} result submitted ✓ tx={}",
-        job_id,
-        tx_hash_result
-    );
+
+    let tx_hash_result = if let Some(claim) = worker_claim {
+        let (tx, _) = submit_result_via_msig(
+            rpc_url,
+            signer,
+            &claim.worker_msig,
+            &claim.submit_action_json,
+            &claim.submit_sig_bytes,
+            nonce_cache,
+        )?;
+        tracing::info!("[escrow] {} result submitted via worker msig ✓ tx={}", job_id, tx);
+        tx
+    } else {
+        let (tx, _) = submit_result(
+            rpc_url,
+            signer,
+            escrow_contract,
+            job_id,
+            &kv_ref.to_json(),
+            nonce_cache,
+        )?;
+        tracing::info!("[escrow] {} result submitted (daemon signer) ✓ tx={}", job_id, tx);
+        tx
+    };
 
     // 5. Wait for settlement
     let final_escrow = wait_for_settlement(
