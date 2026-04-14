@@ -1,12 +1,12 @@
 # near-inlayer — Offchain Compute Daemon + Escrow Plumbing
 
-Offchain daemon for NEAR Protocol. Routes tasks to external AI agents via Nostr, handles on-chain plumbing (claim, KV write, submit_result), and runs verification. The daemon never does work — it's the dumb pipe between task agents, worker agents, and the escrow contract.
+Offchain daemon for NEAR Protocol. Routes tasks to external AI agents (each with their own msig) via Nostr, relays signed on-chain actions, handles KV writes and verification. The daemon never does work — it's the dumb pipe between task agents, worker agents, and the escrow contract.
 
 Paired with [near-escrow](../near-escrow/) for the agent-to-agent task marketplace.
 
 ## Architecture
 
-The daemon is a dumb pipe — it routes tasks and handles on-chain plumbing (claim, KV write, submit_result), but **never does work**. Work is done by external AI agents that interact only via Nostr.
+The daemon is a dumb pipe — it routes tasks, relays worker-signed actions via msig.execute(), and handles KV writes. But it **never does work**. Work is done by external AI agents (each with their own msig) that interact only via Nostr.
 
 ```
                         NEAR Protocol
@@ -33,9 +33,9 @@ The daemon is a dumb pipe — it routes tasks and handles on-chain plumbing (cla
                   │  │ Relayer  │ │ Plumbing │ │  Verifier  ││
                   │  │ Thread   │ │ Thread   │ │  Thread    ││
                   │  │          │ │(41002    │ │            ││
-                  │  │ Nostr    │ │ handler) │ │ poll       ││
-                  │  │ →msig    │ │ →claim   │ │ →Gemini    ││
-                  │  │ →chain   │ │ →KV      │ │ →resume    ││
+                  │  │ Nostr    │ │(41002    │ │            ││
+                  │  │ →msig    │ │→worker   │ │ poll       ││
+                  │  │ →chain   │ │ msig+KV  │ │ →Gemini    ││
                   │  └──────────┘ └──────────┘ └────────────┘│
                   │                                           │
                   └───────────────────────────────────────────┘
@@ -60,7 +60,7 @@ The daemon is a dumb pipe — it routes tasks and handles on-chain plumbing (cla
 
 ## Nostr ↔ Contract Flow
 
-Every escrow action goes through Nostr. The contract never talks to Nostr directly — the daemon bridges them. The daemon **never does work** — it only handles on-chain plumbing after an external AI agent posts its result.
+Every escrow action goes through Nostr. The contract never talks to Nostr directly — the daemon bridges them. The daemon **never does work** — it relays worker-signed claim/submit actions via msig.execute() and handles KV writes after an external AI agent posts its result.
 
 ```
 TASK AGENT                     NOSTR                        DAEMON                       NEAR ON-CHAIN
@@ -159,8 +159,8 @@ Legacy kinds 7200-7205 supported for backwards compatibility.
 | Component | Path | Description |
 |-----------|------|-------------|
 | Job Queue Contract | `contract/` | NEAR contract for direct mode (~650 lines) |
-| Daemon | `worker/src/daemon/` | Nostr routing + escrow plumbing (claim, KV, submit) |
-| escrow_client.rs | `worker/src/daemon/escrow_client.rs` | claim, submit_result, write_kv, run_escrow_job |
+| Daemon | `worker/src/daemon/` | Nostr routing + worker msig relay + KV writes |
+| escrow_client.rs | `worker/src/daemon/escrow_client.rs` | claim, claim_via_msig, submit_result, submit_result_via_msig, write_kv, run_escrow_job |
 | escrow_commands.rs | `worker/src/daemon/escrow_commands.rs` | CLI subcommands + thread spawners |
 | nostr.rs | `worker/src/daemon/nostr.rs` | Nostr pub/sub (kind 41000-41005) |
 | manage.rs | `worker/src/daemon/manage.rs` | DaemonConfig (execution_mode, escrow fields) |
@@ -174,7 +174,7 @@ Legacy kinds 7200-7205 supported for backwards compatibility.
 | Mode | Config Value | What Runs |
 |------|-------------|-----------|
 | Direct | `execution_mode = "direct"` | Job-queue polling only |
-| Escrow | `execution_mode = "escrow"` | Relayer + plumbing + verifier threads (daemon handles on-chain ops, external AI agents do the work) |
+| Escrow | `execution_mode = "escrow"` | Relayer + plumbing + verifier threads (daemon relays worker msig actions, external AI agents do the work) |
 | Both | `execution_mode = "both"` | Direct + escrow threads |
 
 ## Quick Start
@@ -297,11 +297,13 @@ worker/src/daemon/
 ├── escrow_client.rs     # Escrow interaction functions
 │                        #   - get_escrow()        → view escrow state
 │                        #   - poll_until_open()   → retry until funded
-│                        #   - claim()             → claim for worker
-│                        #   - submit_result()     → submit + triggers yield
+│                        #   - claim()             → claim (daemon signer fallback)
+│                        #   - claim_via_msig()    → claim via worker msig
+│                        #   - submit_result()     → submit (daemon signer fallback)
+│                        #   - submit_result_via_msig() → submit via worker msig
 │                        #   - write_kv()          → write to FastNear KV
 │                        #   - wait_for_settlement() → poll until settled
-│                        #   - run_escrow_job()    → full claim→execute→submit
+│                        #   - run_escrow_job()    → full lifecycle (worker msig or daemon signer)
 │
 ├── escrow_commands.rs   # CLI subcommands + daemon thread spawners
 │                        #   - cmd_post_task()     → sign + post to Nostr
@@ -382,8 +384,8 @@ cd worker && cargo test  # 17 tests
 
 ## Key Design Decisions
 
-- Daemon is dumb pipe — routes tasks, handles KV writes, submits results. No business logic.
-- One process, three threads (relayer + worker + verifier). No separate processes to manage.
+- Daemon is dumb pipe — routes tasks, relays worker-signed actions via msig.execute(), handles KV writes. No business logic.
+- One process, three threads (relayer + plumbing + verifier). No separate processes to manage.
 - Nostr is discovery only — contracts don't know about it.
 - FastNear KV for large results — small KV reference on-chain, full data off-chain.
 - Verifier thread is optional — skips if GEMINI_API_KEY not set.
