@@ -759,12 +759,15 @@ fn handle_nostr_dispatch(
     }
 }
 
-/// Escrow mode handler for kind 41002 (RESULT from external AI agent).
+/// Escrow mode handler for kind 41002 (RESULT from worker agent).
 ///
-/// The external AI agent posts its work output via Nostr kind 41002.
-/// The daemon handles the on-chain plumbing: claim → write KV → submit result → wait for settlement.
+/// The worker agent (has own msig) posts its work output via Nostr kind 41002.
+/// The event tags include worker_msig, claim_action, claim_sig, submit_action, submit_sig.
+/// The daemon relays claim+submit via worker_msig.execute() and writes KV with daemon signer.
 ///
-/// Flow: parse result from event → claim escrow → write KV → submit_result → wait for settlement → publish 41005
+/// Flow: extract worker msig tags → relay claim via msig → write KV → relay submit via msig → wait → publish 41005
+///
+/// If worker msig tags are missing, falls back to daemon signer for claim+submit.
 fn handle_nostr_result_escrow(
     event: &nostr::NostrEvent,
     daemon_cfg: &DaemonConfig,
@@ -814,7 +817,7 @@ fn handle_nostr_result_escrow(
         return;
     }
 
-    log(&format!("   [escrow] agent result for job_id={} ({} bytes)", job_id, result_output.len()));
+    log(&format!("   [escrow] worker result for job_id={} ({} bytes)", job_id, result_output.len()));
 
     // Extract worker msig data from tags (optional — fallback to daemon signer)
     let worker_claim = {

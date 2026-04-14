@@ -1702,6 +1702,9 @@ Environment Variables:\n\
         "verifier" => {
             offchainvm_worker::daemon::escrow_commands::cmd_verifier(&args[2..], &config_dir)?;
         }
+        "post-result" => {
+            offchainvm_worker::daemon::escrow_commands::cmd_post_result(&args[2..], &config_dir)?;
+        }
         cmd => { eprintln!("Unknown: {}. Run: inlayer help", cmd); std::process::exit(1); }
     }
     Ok(())
