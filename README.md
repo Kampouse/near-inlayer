@@ -1,10 +1,12 @@
-# near-inlayer — Offchain WASM Compute + Escrow Daemon
+# near-inlayer — Offchain Compute Daemon + Escrow Plumbing
 
-WASM execution engine for NEAR Protocol. Runs as a daemon that polls for jobs, executes WASM locally, and resolves results on-chain. In escrow mode, the daemon also runs relayer and verifier threads — one process handles everything.
+Offchain daemon for NEAR Protocol. Routes tasks to external AI agents via Nostr, handles on-chain plumbing (claim, KV write, submit_result), and runs verification. The daemon never does work — it's the dumb pipe between task agents, worker agents, and the escrow contract.
 
 Paired with [near-escrow](../near-escrow/) for the agent-to-agent task marketplace.
 
 ## Architecture
+
+The daemon is a dumb pipe — it routes tasks and handles on-chain plumbing (claim, KV write, submit_result), but **never does work**. Work is done by external AI agents that interact only via Nostr.
 
 ```
                         NEAR Protocol
@@ -25,15 +27,16 @@ Paired with [near-escrow](../near-escrow/) for the agent-to-agent task marketpla
                             │ RPC
                   ┌─────────┴─────────────────────────────────┐
                   │          inlayer daemon (1 process)        │
+                  │       "Dumb pipes — routes, never works"  │
                   │                                           │
-                  │  ┌──────────┐ ┌────────┐ ┌────────────┐  │
-                  │  │ Relayer  │ │ Worker │ │  Verifier  │  │
-                  │  │ Thread   │ │ Thread │ │  Thread    │  │
-                  │  │          │ │        │ │            │  │
-                  │  │ Nostr    │ │ claim  │ │ poll       │  │
-                  │  │ →msig    │ │ →WASM  │ │ →Gemini    │  │
-                  │  │ →chain   │ │ →KV    │ │ →resume    │  │
-                  │  └──────────┘ └────────┘ └────────────┘  │
+                  │  ┌──────────┐ ┌──────────┐ ┌────────────┐│
+                  │  │ Relayer  │ │ Plumbing │ │  Verifier  ││
+                  │  │ Thread   │ │ Thread   │ │  Thread    ││
+                  │  │          │ │(41002    │ │            ││
+                  │  │ Nostr    │ │ handler) │ │ poll       ││
+                  │  │ →msig    │ │ →claim   │ │ →Gemini    ││
+                  │  │ →chain   │ │ →KV      │ │ →resume    ││
+                  │  └──────────┘ └──────────┘ └────────────┘│
                   │                                           │
                   └───────────────────────────────────────────┘
                             ▲                    ▲
@@ -44,14 +47,22 @@ Paired with [near-escrow](../near-escrow/) for the agent-to-agent task marketpla
                   │  41005         │    │                  │
                   └────────────────┘    │  result/{job_id} │
                                         └──────────────────┘
+
+         ┌──────────────────┐  ┌──────────────────┐
+         │  Task Agent      │  │  Worker Agent    │
+         │  (posts 41000)   │  │  (external AI)   │
+         │                  │  │  sees 41000,     │
+         │  creates escrow  │  │  does work,      │
+         │  on-chain        │  │  posts 41002     │
+         └──────────────────┘  └──────────────────┘
 ```
 
 ## Nostr ↔ Contract Flow
 
-Every escrow action goes through Nostr. The contract never talks to Nostr directly — the daemon bridges them.
+Every escrow action goes through Nostr. The contract never talks to Nostr directly — the daemon bridges them. The daemon **never does work** — it only handles on-chain plumbing after an external AI agent posts its result.
 
 ```
-AGENT                        NOSTR                        DAEMON                       NEAR ON-CHAIN
+TASK AGENT                     NOSTR                        DAEMON                       NEAR ON-CHAIN
   │                            │                            │                             │
   │ 1. Sign CreateEscrow       │                            │                             │
   │    + FundEscrow            │                            │                             │
@@ -71,49 +82,59 @@ AGENT                        NOSTR                        DAEMON                
   │                            │                            │               create_escrow()├──►│ PendingFunding
   │                            │                            │               fund_escrow()  ├──►│ Open
   │                            │                            │                             │
-  │                            │ 6. Worker ◄───────────────│                             │
-  │                            │    sees same 41000         │                             │
-  │                            │                            │ 7. poll_until_open() ──────►│
-  │                            │                            │ 8. claim() ────────────────►│ InProgress
+
+WORKER AGENT (external AI)     │                            │                             │
   │                            │                            │                             │
-  │                            │                            │ 9. Execute WASM             │
+  │ 6. See kind 41000 ◄───────│                            │                             │
+  │    (task available)        │                            │                             │
   │                            │                            │                             │
-  │                            │                            │ 10. Write result to KV ────►│
+  │ 7. Do actual work off-chain│                            │                             │
+  │    (NOT the daemon)        │                            │                             │
   │                            │                            │                             │
-  │                            │                            │ 11. submit_result() ───────►│ Verifying (YIELDS)
+  │ 8. POST kind 41002 ───────►│                            │                             │
+  │    {job_id, result/output} │                            │                             │
+  │                            │                            │                             │
+  │                            │ 9. Plumbing thread ◄──────│                             │
+  │                            │    sees 41002              │                             │
+  │                            │                            │ 10. poll_until_open() ─────►│
+  │                            │                            │ 11. claim() ────────────────►│ InProgress
+  │                            │                            │                             │
+  │                            │                            │ 12. Write result to KV ────►│
+  │                            │                            │                             │
+  │                            │                            │ 13. submit_result() ───────►│ Verifying (YIELDS)
   │                            │                            │    {kv_account, kv_key}     │
   │                            │                            │                             │
   │                            │                            │ ─── ~200 block timeout ──── │
   │                            │                            │                             │
-  │                            │                            │ 12. Verifier polls ────────►│
+  │                            │                            │ 14. Verifier polls ────────►│
   │                            │                            │     list_verifying()        │
   │                            │                            │                             │
-  │                            │                            │ 13. Fetch result from KV    │
+  │                            │                            │ 15. Fetch result from KV    │
   │                            │                            │     (HTTP GET fastnear)     │
   │                            │                            │                             │
-  │                            │                            │ 14. Score via Gemini API    │
+  │                            │                            │ 16. Score via Gemini API    │
   │                            │                            │     (4 passes, median)      │
   │                            │                            │                             │
-  │                            │                            │ 15. resume_verification() ─►│
+  │                            │                            │ 17. resume_verification() ─►│
   │                            │                            │     {score, passed}         │
   │                            │                            │                             │
   │                            │                            │            settlement_cb()──├──►│
   │                            │                            │            ft_transfer()   ├──►│ worker paid
   │                            │                            │                             │
-  │                            │ 16. POST kind 41005 ◄─────│                             │
-  │ 17. Agent sees 41005 ◄────│    (confirmed)             │                             │
+  │                            │ 18. POST kind 41005 ◄─────│                             │
+  │ 19. Agent sees 41005 ◄────│    (confirmed)             │                             │
 ```
 
 ## Nostr Event Kinds
 
 | Kind | Name | Who Sends | Tags |
 |------|------|-----------|------|
-| 41000 | TASK | Agent | action, action_sig, fund_action, fund_action_sig, agent, description, reward |
-| 41001 | CLAIM | Worker | job_id, worker_account |
-| 41002 | RESULT | Worker | job_id, kv_reference |
-| 41003 | ACTION | Agent | action, action_sig, agent |
-| 41004 | DISPATCHED | Daemon | job_id, wasm_url |
-| 41005 | CONFIRMED | Daemon | job_id, score, passed |
+| 41000 | TASK | Task Agent | action, action_sig, fund_action, fund_action_sig, agent, description, reward |
+| 41001 | CLAIM | Daemon (plumbing) | job_id, worker_account |
+| 41002 | RESULT | Worker Agent (external AI) | job_id, result/output |
+| 41003 | ACTION | Task Agent | action, action_sig, agent |
+| 41004 | DISPATCHED | Daemon (relayer) | job_id, escrow_id |
+| 41005 | CONFIRMED | Daemon (verifier) | job_id, score, passed |
 
 Legacy kinds 7200-7205 supported for backwards compatibility.
 
@@ -122,7 +143,7 @@ Legacy kinds 7200-7205 supported for backwards compatibility.
 | Component | Path | Description |
 |-----------|------|-------------|
 | Job Queue Contract | `contract/` | NEAR contract for direct mode (~650 lines) |
-| Daemon | `worker/src/daemon/` | WASM execution + escrow bridge |
+| Daemon | `worker/src/daemon/` | Nostr routing + escrow plumbing (claim, KV, submit) |
 | escrow_client.rs | `worker/src/daemon/escrow_client.rs` | claim, submit_result, write_kv, run_escrow_job |
 | escrow_commands.rs | `worker/src/daemon/escrow_commands.rs` | CLI subcommands + thread spawners |
 | nostr.rs | `worker/src/daemon/nostr.rs` | Nostr pub/sub (kind 41000-41005) |
@@ -136,8 +157,8 @@ Legacy kinds 7200-7205 supported for backwards compatibility.
 
 | Mode | Config Value | What Runs |
 |------|-------------|-----------|
-| Direct | `execution_mode = "direct"` | Worker only — polls job-queue contract |
-| Escrow | `execution_mode = "escrow"` | Worker + relayer + verifier threads |
+| Direct | `execution_mode = "direct"` | Job-queue polling only |
+| Escrow | `execution_mode = "escrow"` | Relayer + plumbing + verifier threads (daemon handles on-chain ops, external AI agents do the work) |
 | Both | `execution_mode = "both"` | Direct + escrow threads |
 
 ## Quick Start

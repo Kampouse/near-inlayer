@@ -696,7 +696,24 @@ fn handle_nostr_event(
         }
         nostr::KIND_RESULT => {
             log(&format!(" nostr RESULT from {}...", &event.pubkey[..8.min(event.pubkey.len())]));
-            handle_nostr_result(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
+            match daemon_cfg.execution_mode.as_str() {
+                "escrow" => {
+                    log("   [41002] escrow mode: routing to escrow plumbing");
+                    handle_nostr_result_escrow(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
+                }
+                "both" => {
+                    // If result has job_id in escrow format, use escrow flow; otherwise direct
+                    let has_escrow_context = event.content.contains("\"job_id\"")
+                        || event.tags.iter().any(|t| t.len() >= 2 && t[0] == "job_id");
+                    if has_escrow_context && daemon_cfg.escrow_contract.is_some() {
+                        log("   [41002] both mode: routing to escrow plumbing");
+                        handle_nostr_result_escrow(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
+                    } else {
+                        handle_nostr_result(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
+                    }
+                }
+                _ => handle_nostr_result(event, daemon_cfg, signer, nonce_cache, rpc_url, log),
+            }
         }
         nostr::KIND_CLAIM => {
             log(&format!(" nostr CLAIM from {}...", &event.pubkey[..8.min(event.pubkey.len())]));
@@ -710,10 +727,9 @@ fn handle_nostr_event(
 
 /// Kind 41000 — Agent posted a task.
 ///
-/// Routes based on execution_mode:
-///   "direct" → call request_execution() on inlayer contract (existing flow)
-///   "escrow" → claim on escrow contract → route to worker → write KV → submit result
-///   "both"   → direct for inlayer tasks, escrow for tasks with escrow tags
+/// In escrow mode, the relayer thread handles submitting on-chain. The daemon
+/// just logs it here — no direct action needed.
+/// In direct/both mode, routes to the existing inlayer request_execution flow.
 fn handle_nostr_dispatch(
     event: &nostr::NostrEvent,
     daemon_cfg: &DaemonConfig,
@@ -725,13 +741,15 @@ fn handle_nostr_dispatch(
     log("   [41000] handle_nostr_dispatch start");
 
     match daemon_cfg.execution_mode.as_str() {
-        "escrow" => handle_nostr_dispatch_escrow(event, daemon_cfg, signer, nonce_cache, rpc_url, log),
+        "escrow" => {
+            // Relayer thread handles task submission — nothing for daemon to do
+            log("   [41000] escrow mode: task picked up by relayer thread");
+        }
         "both" => {
-            // If event has escrow tags (action_sig + fund_action_sig), route to escrow
+            // If event has escrow tags, relayer handles it
             let has_escrow_tags = event.tags.iter().any(|t| t.len() >= 2 && t[0] == "fund_action_sig");
             if has_escrow_tags {
-                log("   [41000] both mode: routing to escrow (has escrow tags)");
-                handle_nostr_dispatch_escrow(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
+                log("   [41000] both mode: escrow task — relayer thread handles");
             } else {
                 log("   [41000] both mode: routing to direct (no escrow tags)");
                 handle_nostr_dispatch_direct(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
@@ -741,9 +759,13 @@ fn handle_nostr_dispatch(
     }
 }
 
-/// Escrow mode handler for kind 41000.
-/// Flow: parse event → poll escrow until Open → claim → route to worker → write KV → submit result → wait for settlement
-fn handle_nostr_dispatch_escrow(
+/// Escrow mode handler for kind 41002 (RESULT from external AI agent).
+///
+/// The external AI agent posts its work output via Nostr kind 41002.
+/// The daemon handles the on-chain plumbing: claim → write KV → submit result → wait for settlement.
+///
+/// Flow: parse result from event → claim escrow → write KV → submit_result → wait for settlement → publish 41005
+fn handle_nostr_result_escrow(
     event: &nostr::NostrEvent,
     daemon_cfg: &DaemonConfig,
     signer: &InMemorySigner,
@@ -760,19 +782,39 @@ fn handle_nostr_dispatch_escrow(
         None => { log("   [escrow] kv_account not configured — skipping"); return; }
     };
 
-    // Parse job_id from event tags
-    let job_id = event.tags.iter()
-        .find(|t| t.len() >= 2 && t[0] == "job_id")
-        .and_then(|t| t.get(1))
-        .map(|s| s.as_str())
+    // Parse result content from agent
+    let content: serde_json::Value = match serde_json::from_str(&event.content) {
+        Ok(v) => v,
+        Err(e) => { log(&format!("   [escrow] result: invalid JSON — {}", e)); return; }
+    };
+
+    let job_id = match content.get("job_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            // Fallback: check tags
+            match event.tags.iter()
+                .find(|t| t.len() >= 2 && t[0] == "job_id")
+                .and_then(|t| t.get(1))
+                .map(|s| s.as_str())
+            {
+                Some(id) => id.to_string(),
+                None => { log("   [escrow] result: missing job_id — skipping"); return; }
+            }
+        }
+    };
+
+    // Agent's output — can be in "result" or "output" field
+    let result_output = content.get("result")
+        .or_else(|| content.get("output"))
+        .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    if job_id.is_empty() {
-        log("   [escrow] no job_id tag in event — skipping");
+    if result_output.is_empty() {
+        log("   [escrow] result: empty output — skipping");
         return;
     }
 
-    log(&format!("   [escrow] processing job_id={}", job_id));
+    log(&format!("   [escrow] agent result for job_id={} ({} bytes)", job_id, result_output.len()));
 
     // Build RPC pool for view calls
     let rpc = match rpc_pool::Rpc::new(rpc_url) {
@@ -780,21 +822,17 @@ fn handle_nostr_dispatch_escrow(
         Err(e) => { log(&format!("   [escrow] RPC init failed: {}", e)); return; }
     };
 
-    // Run the full escrow flow
+    // Run the full escrow plumbing: claim → KV → submit_result → wait for settlement
     let result = escrow_client::run_escrow_job(
         &rpc,
         rpc_url,
         signer,
         escrow_contract,
         kv_account,
-        job_id,
+        &job_id,
         daemon_cfg.worker_stake_yocto,
         nonce_cache,
-        |_task_desc, _criteria| {
-            // TODO: Route to actual worker agent
-            // For now, return a placeholder
-            Ok("placeholder result".to_string())
-        },
+        result_output,
     );
 
     match result {

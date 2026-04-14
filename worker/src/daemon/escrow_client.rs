@@ -300,17 +300,16 @@ pub struct EscrowJobResult {
     pub tx_hash_kv: String,
 }
 
-/// Run the full escrow flow for a single job:
-/// 1. Poll until Open
-/// 2. Claim
-/// 3. Write result to KV
-/// 4. Submit KV reference to escrow
-/// 5. Wait for settlement
+/// Run the full escrow job lifecycle:
+///   1. Poll until Open (funded)
+///   2. Claim (put up stake)
+///   3. Write result to FastNear KV
+///   4. Submit KV reference to escrow contract
+///   5. Wait for verification + settlement
 ///
-/// `work_fn` is called between claim and KV write — it receives the task
-/// description and returns the work output. The daemon routes this to a
-/// worker agent.
-pub fn run_escrow_job<F>(
+/// The actual work is done by the external agent — it posts the result via Nostr (kind 41002).
+/// The daemon only handles the on-chain plumbing.
+pub fn run_escrow_job(
     rpc: &rpc_pool::Rpc,
     rpc_url: &str,
     signer: &InMemorySigner,
@@ -319,13 +318,10 @@ pub fn run_escrow_job<F>(
     job_id: &str,
     stake_yocto: u128,
     nonce_cache: &NonceCache,
-    work_fn: F,
-) -> Result<EscrowJobResult>
-where
-    F: FnOnce(&str, &str) -> Result<String>, // (task_description, criteria) -> output
-{
+    result_output: &str,
+) -> Result<EscrowJobResult> {
     // 1. Poll until Open
-    let escrow = poll_until_open(
+    let _escrow = poll_until_open(
         rpc,
         escrow_contract,
         job_id,
@@ -343,19 +339,11 @@ where
     )?;
     tracing::info!("[escrow] {} claimed ✓ tx={}", job_id, tx_hash_claim);
 
-    // 3. Do the work
-    let output = work_fn(&escrow.task_description, &escrow.criteria)?;
-    tracing::info!(
-        "[escrow] {} work done ({} bytes output)",
-        job_id,
-        output.len()
-    );
-
-    // 4. Write to KV
+    // 3. Write result to KV
     let kv_key = format!("result/{}", job_id);
-    let tx_hash_kv = write_kv(rpc_url, signer, kv_account, &kv_key, &output, nonce_cache)?;
+    let tx_hash_kv = write_kv(rpc_url, signer, kv_account, &kv_key, result_output, nonce_cache)?;
 
-    // 5. Submit KV reference to escrow
+    // 4. Submit KV reference to escrow
     let kv_ref = KvReference {
         kv_account: kv_account.to_string(),
         kv_predecessor: signer.account_id.to_string(),
@@ -375,7 +363,7 @@ where
         tx_hash_result
     );
 
-    // 6. Wait for settlement
+    // 5. Wait for settlement
     let final_escrow = wait_for_settlement(
         rpc,
         escrow_contract,
