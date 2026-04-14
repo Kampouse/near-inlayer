@@ -208,7 +208,7 @@ impl DaemonConfig {
                         tracing::info!("📁 Using config from: {}", path.display());
                         return cfg;
                     } else {
-                        eprintln!("WARN: TOML parse failed for {}", path.display());
+                        tracing::warn!("TOML parse failed for {}", path.display());
                     }
                 }
             }

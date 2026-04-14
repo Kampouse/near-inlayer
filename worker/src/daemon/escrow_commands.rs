@@ -15,6 +15,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use near_crypto::InMemorySigner;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn, error, debug};
 
 use super::manage::DaemonConfig;
 use super::nonce::NonceCache;
@@ -68,7 +69,7 @@ pub fn spawn_supervisor(
             let mut relayer_missed: u32 = 0;
             let mut verifier_missed: u32 = 0;
 
-            eprintln!("[supervisor] started — checking every {}s", check_interval.as_secs());
+            info!("supervisor started — checking every {}s", check_interval.as_secs());
 
             loop {
                 std::thread::sleep(check_interval);
@@ -79,20 +80,20 @@ pub fn spawn_supervisor(
                 } else {
                     relayer_missed += 1;
                     if relayer_missed >= max_missed {
-                        eprintln!("[supervisor] relayer silent for {} checks — restarting", relayer_missed);
+                        warn!("relayer silent for {} checks — restarting", relayer_missed);
                         relayer_missed = 0;
                         let cfg = config_dir.clone();
                         let health = relayer_health.clone();
                         std::thread::spawn(move || {
-                            eprintln!("[supervisor] spawning new relayer thread...");
+                            info!("spawning new relayer thread");
                             let handle = spawn_relayer_thread(cfg);
                             health.ping(); // Mark alive on spawn
                             let _ = handle.join();
-                            eprintln!("[supervisor] relayer thread exited");
+                            info!("relayer thread exited");
                         });
                         relayer_health.restart_count.store(true, Ordering::Relaxed);
                     } else if relayer_missed > 1 {
-                        eprintln!("[supervisor] relayer missed {} heartbeat(s)", relayer_missed);
+                        warn!("relayer missed {} heartbeat(s)", relayer_missed);
                     }
                 }
 
@@ -103,20 +104,20 @@ pub fn spawn_supervisor(
                     } else {
                         verifier_missed += 1;
                         if verifier_missed >= max_missed {
-                            eprintln!("[supervisor] verifier silent for {} checks — restarting", verifier_missed);
+                            warn!("verifier silent for {} checks — restarting", verifier_missed);
                             verifier_missed = 0;
                             let cfg = config_dir.clone();
                             let health = vh.clone();
                             std::thread::spawn(move || {
-                                eprintln!("[supervisor] spawning new verifier thread...");
+                                info!("spawning new verifier thread");
                                 let handle = spawn_verifier_thread(cfg);
                                 health.ping();
                                 let _ = handle.join();
-                                eprintln!("[supervisor] verifier thread exited");
+                                info!("verifier thread exited");
                             });
                             vh.restart_count.store(true, Ordering::Relaxed);
                         } else if verifier_missed > 1 {
-                            eprintln!("[supervisor] verifier missed {} heartbeat(s)", verifier_missed);
+                            warn!("verifier missed {} heartbeat(s)", verifier_missed);
                         }
                     }
                 }
@@ -207,7 +208,7 @@ pub fn cmd_post_task(args: &[String], _config_dir: &Path) -> Result<()> {
             "--category" => { category = args[i + 1].clone(); i += 2; }
             "--skills" => { skills = args[i + 1].clone(); i += 2; }
             "--npub" => { npub = args[i + 1].clone(); i += 2; }
-            _ => { eprintln!("Unknown arg: {}", args[i]); i += 1; }
+            _ => { warn!("unknown arg: {}", args[i]); i += 1; }
         }
     }
 
@@ -294,8 +295,7 @@ pub fn cmd_post_task(args: &[String], _config_dir: &Path) -> Result<()> {
     super::nostr::publish_event(relay, &nostr_key, super::nostr::KIND_TASK, &content_str, tags)
         .map_err(|e| anyhow::anyhow!("publish: {}", e))?;
 
-    println!("Task posted: job_id={}", job_id);
-    println!("  kind=41000, nonce={}, fund_nonce={}", next_nonce, fund_nonce);
+    info!(job_id = %job_id, nonce = next_nonce, fund_nonce, "task posted (kind=41000)");
     Ok(())
 }
 
@@ -331,9 +331,7 @@ pub fn cmd_relayer(args: &[String], config_dir: &Path) -> Result<()> {
     if dry_run {
         let relay = daemon_cfg.nostr_relay.as_deref()
             .ok_or_else(|| anyhow::anyhow!("nostr_relay not configured"))?;
-        println!("Relayer dry-run: relay={}", relay);
-        println!("  account={}, watching kinds 41000,41003", signer.account_id);
-        println!("  (use without --dry-run to actually submit)");
+        info!(relay = %relay, account = %signer.account_id, "relayer dry-run (use without --dry-run to submit)");
         return Ok(());
     }
 
@@ -391,18 +389,17 @@ pub fn cmd_verifier(args: &[String], config_dir: &Path) -> Result<()> {
     let gemini_key = std::env::var("GEMINI_API_KEY")
         .context("GEMINI_API_KEY env var required")?;
 
-    println!("Verifier starting: escrow={}", escrow_contract);
-    println!("  account={}", signer.account_id);
+    info!(escrow = %escrow_contract, account = %signer.account_id, "verifier starting");
 
     loop {
         match run_verifier_cycle(&rpc, &rpc_url, &signer, &nonce_cache, escrow_contract, &gemini_key, &processed) {
             Ok(count) => {
                 if count > 0 {
-                    println!("  processed {} escrows", count);
+                    info!("processed {} escrows", count);
                 }
             }
             Err(e) => {
-                eprintln!("  verifier cycle error: {}", e);
+                error!("verifier cycle error: {}", e);
             }
         }
 
@@ -438,12 +435,12 @@ fn run_verifier_cycle(
             while p.len() > 10_000 { p.pop_front(); }
         }
 
-        println!("[verifier] processing job_id={}", ve.job_id);
+        info!(job_id = %ve.job_id, "verifier processing escrow");
 
         // 1. Get escrow details
         let escrow = super::escrow_client::get_escrow(rpc, escrow_contract, &ve.job_id)?;
         if escrow.status != "Verifying" {
-            eprintln!("  job {} status={} (not Verifying), skipping", ve.job_id, escrow.status);
+            warn!(job_id = %ve.job_id, status = %escrow.status, "skipping — not Verifying");
             continue;
         }
 
@@ -453,7 +450,7 @@ fn run_verifier_cycle(
         let result_content = match fetch_kv_result(result_str) {
             Ok(content) => content,
             Err(e) => {
-                eprintln!("  KV fetch failed for {}: {}, using raw result", ve.job_id, e);
+                warn!(job_id = %ve.job_id, error = %e, "KV fetch failed, using raw result");
                 result_str.to_string()
             }
         };
@@ -476,7 +473,7 @@ fn run_verifier_cycle(
         };
         let verdict_json = serde_json::to_string(&verdict)?;
 
-        println!("  scored: {} ({}passed)", verdict.score, if passed { "" } else { "NOT " });
+        info!(score = verdict.score, passed, "escrow scored");
 
         // 4. Resume verification on-chain
         let resume_args = serde_json::json!({
@@ -491,10 +488,10 @@ fn run_verifier_cycle(
             nonce_cache,
         ) {
             Ok((tx_hash, _)) => {
-                println!("  resumed ✓ tx={}", &tx_hash[..16.min(tx_hash.len())]);
+                info!(tx = &&tx_hash[..16.min(tx_hash.len())], "verification resumed");
             }
             Err(e) => {
-                eprintln!("  resume FAILED for {}: {}", ve.job_id, e);
+                error!(job_id = %ve.job_id, error = %e, "resume FAILED");
             }
         }
 
@@ -661,11 +658,11 @@ fn score_with_gemini(
     for i in 0..num_passes {
         match gemini_single_pass(api_key, &prompt, i) {
             Ok(pr) => {
-                eprintln!("  pass {}/{}: score={}", i + 1, num_passes, pr.score);
+                debug!(pass = i + 1, total = num_passes, score = pr.score, "scoring pass complete");
                 pass_results.push(pr);
             }
             Err(e) => {
-                eprintln!("  pass {}/{} FAILED: {}", i + 1, num_passes, e);
+                warn!(pass = i + 1, total = num_passes, error = %e, "scoring pass FAILED");
                 pass_results.push(PassResult {
                     score: 0,
                     reasoning: format!("Error: {}", e),
@@ -721,7 +718,7 @@ pub fn spawn_relayer_thread_with_health(
             let rpc_url = match daemon_cfg.nostr_relay.as_deref() {
                 Some(_) => daemon_cfg.rpc_url(),
                 None => {
-                    eprintln!("[relayer] nostr_relay not configured, thread exiting");
+                    error!("nostr_relay not configured, relayer thread exiting");
                     return;
                 }
             };
@@ -729,14 +726,14 @@ pub fn spawn_relayer_thread_with_health(
             let signer = match super::manage::load_signer(&daemon_cfg.key_path) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[relayer] failed to load signer: {}", e);
+                    error!(error = %e, "failed to load signer, relayer thread exiting");
                     return;
                 }
             };
             let nonce_cache = NonceCache::new(rpc_url.clone(), signer.clone());
 
             if let Err(e) = run_relayer_inner(&daemon_cfg, &rpc_url, &signer, &nonce_cache, health.as_ref()) {
-                eprintln!("[relayer] thread exited with error: {}", e);
+                error!(error = %e, "relayer thread exited with error");
             }
         })
         .expect("failed to spawn relayer thread")
@@ -759,7 +756,7 @@ pub fn spawn_verifier_thread_with_health(
             let escrow_contract = match daemon_cfg.escrow_contract.as_deref() {
                 Some(c) => c.to_string(),
                 None => {
-                    eprintln!("[verifier] escrow_contract not configured, thread exiting");
+                    error!("escrow_contract not configured, verifier thread exiting");
                     return;
                 }
             };
@@ -767,14 +764,14 @@ pub fn spawn_verifier_thread_with_health(
             let signer = match super::manage::load_signer(&daemon_cfg.key_path) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[verifier] failed to load signer: {}", e);
+                    error!(error = %e, "failed to load signer, verifier thread exiting");
                     return;
                 }
             };
             let rpc = match make_rpc(&rpc_url) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[verifier] RPC init failed: {}", e);
+                    error!(error = %e, "RPC init failed, verifier thread exiting");
                     return;
                 }
             };
@@ -784,23 +781,22 @@ pub fn spawn_verifier_thread_with_health(
             let gemini_key = match std::env::var("GEMINI_API_KEY") {
                 Ok(k) => k,
                 Err(_) => {
-                    eprintln!("[verifier] GEMINI_API_KEY not set, thread exiting");
+                    error!("GEMINI_API_KEY not set, verifier thread exiting");
                     return;
                 }
             };
 
-            eprintln!("[verifier] starting: escrow={}", escrow_contract);
-            eprintln!("[verifier]   account={}", signer.account_id);
+            info!(escrow = %escrow_contract, account = %signer.account_id, "verifier thread starting");
 
             loop {
                 match run_verifier_cycle(&rpc, &rpc_url, &signer, &nonce_cache, &escrow_contract, &gemini_key, &processed) {
                     Ok(count) => {
                         if count > 0 {
-                            eprintln!("[verifier]   processed {} escrows", count);
+                            info!("verifier processed {} escrows", count);
                         }
                     }
                     Err(e) => {
-                        eprintln!("[verifier]   cycle error: {}", e);
+                        error!(error = %e, "verifier cycle error");
                     }
                 }
 
@@ -828,18 +824,17 @@ fn run_relayer_inner(
     let rpc = make_rpc(rpc_url)?;
     let processed: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
-    eprintln!("[relayer] starting: relay={}", relay);
-    eprintln!("[relayer]   account={}, watching kinds 41000,41003", signer.account_id);
+    info!(relay = %relay, account = %signer.account_id, "relayer starting, watching kinds 41000,41003");
 
     let rx = super::nostr::spawn_nostr_subscriber(relay);
-    eprintln!("[relayer]   subscribed, waiting for events...");
+    info!("relayer subscribed, waiting for events");
 
     loop {
         let event = match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(ev) => ev,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                eprintln!("[relayer] Nostr subscriber disconnected, exiting");
+                warn!("Nostr subscriber disconnected, relayer exiting");
                 break;
             }
         };
@@ -857,7 +852,7 @@ fn run_relayer_inner(
         }
 
         let kind_label = if event.kind == super::nostr::KIND_TASK { "TASK" } else { "ACTION" };
-        eprintln!("[relayer] [{}] event from {}...", kind_label, &event.pubkey[..8.min(event.pubkey.len())]);
+        info!(kind = kind_label, pubkey = &event.pubkey[..8.min(event.pubkey.len())], "relayer received event");
 
         let action_json = event.tags.iter()
             .find(|t| t.len() >= 2 && t[0] == "action")
@@ -871,16 +866,16 @@ fn run_relayer_inner(
             .unwrap_or("");
 
         if action_json.is_empty() || action_sig_hex.is_empty() {
-            eprintln!("[relayer]   missing action/action_sig tags, skipping");
+            warn!("missing action/action_sig tags, skipping event");
             continue;
         }
 
         let sig_bytes = match hex::decode(action_sig_hex) {
             Ok(b) => b,
-            Err(e) => { eprintln!("[relayer]   invalid sig hex: {}", e); continue; }
+            Err(e) => { warn!(error = %e, "invalid sig hex, skipping"); continue; }
         };
         if sig_bytes.len() != 64 {
-            eprintln!("[relayer]   invalid sig length: {} bytes", sig_bytes.len());
+            warn!(len = sig_bytes.len(), "invalid sig length");
             continue;
         }
 
@@ -898,7 +893,7 @@ fn run_relayer_inner(
             });
 
         if msig.is_empty() {
-            eprintln!("[relayer]   no msig address found, skipping");
+            warn!("no msig address found, skipping event");
             continue;
         }
 
@@ -914,11 +909,11 @@ fn run_relayer_inner(
             nonce_cache,
         ) {
             Ok((tx_hash, _)) => {
-                eprintln!("[relayer]   submitted ✓ tx={}", &tx_hash[..16.min(tx_hash.len())]);
+                info!(tx = &&tx_hash[..16.min(tx_hash.len())], "relayer submitted on-chain");
                 tx_hash
             }
             Err(e) => {
-                eprintln!("[relayer]   submit FAILED: {}", e);
+                error!(error = %e, "relayer submit FAILED");
                 continue;
             }
         };
@@ -944,7 +939,7 @@ fn run_relayer_inner(
             if !fund_action_json.is_empty() && !fund_sig_hex.is_empty() {
                 let fund_sig_bytes = match hex::decode(fund_sig_hex) {
                     Ok(b) => b,
-                    Err(e) => { eprintln!("[relayer]   invalid fund_sig hex: {}", e); continue; }
+                    Err(e) => { warn!(error = %e, "invalid fund_sig hex, skipping"); continue; }
                 };
 
                 let fund_args = serde_json::json!({
@@ -959,7 +954,7 @@ fn run_relayer_inner(
                     nonce_cache,
                 ) {
                     Ok((tx_hash, _)) => {
-                        eprintln!("[relayer]   fund submitted ✓ tx={}", &tx_hash[..16.min(tx_hash.len())]);
+                        info!(tx = &&tx_hash[..16.min(tx_hash.len())], "fund submitted on-chain");
 
                         // Publish kind 41004 (FUNDED) — signals workers that escrow is ready to claim
                         if let (Some(ref relay), Some(ref nsec)) = (&daemon_cfg.nostr_relay, &daemon_cfg.nostr_nsec) {
@@ -981,13 +976,13 @@ fn run_relayer_inner(
                                 vec!["job_id".into(), job_id_tag],
                             ];
                             match super::nostr::publish_event(relay, nsec, super::nostr::KIND_DISPATCH, &funded_str, funded_tags) {
-                                Ok(()) => eprintln!("[relayer]   published 41004 (FUNDED) ✓"),
-                                Err(e) => eprintln!("[relayer]   failed to publish 41004: {}", e),
+                                Ok(()) => info!("published 41004 (FUNDED)"),
+                                Err(e) => warn!(error = %e, "failed to publish 41004"),
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("[relayer]   fund submit FAILED: {}", e);
+                        error!(error = %e, "fund submit FAILED");
                     }
                 }
             }
@@ -996,5 +991,3 @@ fn run_relayer_inner(
 
     Ok(())
 }
-
-
