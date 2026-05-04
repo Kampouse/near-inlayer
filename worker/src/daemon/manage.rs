@@ -63,6 +63,8 @@ pub struct DaemonConfig {
     pub nostr_relay: Option<String>,
     /// Nostr nsec (hex, 64 chars) for signing coordination events
     pub nostr_nsec: Option<String>,
+    /// Verifier index in the escrow contract's verifier_set (default: 0)
+    pub verifier_index: u8,
     // ── Phase 1 Security ──────────────────────────────────────────────
     /// Allowed program names for Nostr dispatch (default: ["kv-writer"])
     pub allowed_programs: Vec<String>,
@@ -111,6 +113,7 @@ impl Default for DaemonConfig {
             deposit_yocto: 1u128, // 1 yocto — operator gets free execution
             nostr_relay: None,
             nostr_nsec: None,
+            verifier_index: 0,
             // Phase 1 Security defaults
             allowed_programs: vec!["kv-writer".to_string()],
             allowed_actions: vec!["write".to_string()],

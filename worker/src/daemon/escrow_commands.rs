@@ -406,10 +406,14 @@ pub fn cmd_verifier(args: &[String], config_dir: &Path) -> Result<()> {
     let gemini_key = std::env::var("GEMINI_API_KEY")
         .context("GEMINI_API_KEY env var required")?;
 
-    info!(escrow = %escrow_contract, account = %signer.account_id, "verifier starting");
+    let verifier_nsec = daemon_cfg.nostr_nsec.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("nostr_nsec not configured (needed for verifier signing)"))?;
+    let verifier_index = daemon_cfg.verifier_index;
+
+    info!(escrow = %escrow_contract, account = %signer.account_id, verifier_index, "verifier starting");
 
     loop {
-        match run_verifier_cycle(&rpc, &rpc_url, &signer, &nonce_cache, escrow_contract, &gemini_key, &processed) {
+        match run_verifier_cycle(&rpc, &rpc_url, &signer, &nonce_cache, escrow_contract, &gemini_key, &processed, verifier_index, verifier_nsec) {
             Ok(count) => {
                 if count > 0 {
                     info!("processed {} escrows", count);
@@ -435,6 +439,8 @@ fn run_verifier_cycle(
     escrow_contract: &str,
     gemini_key: &str,
     processed: &Mutex<VecDeque<String>>,
+    verifier_index: u8,
+    verifier_nsec: &str,
 ) -> Result<usize> {
     // Fetch verifying escrows
     let bytes = rpc.view(escrow_contract, "list_verifying", b"{}")?;
@@ -492,10 +498,22 @@ fn run_verifier_cycle(
 
         info!(score = verdict.score, passed, "escrow scored");
 
-        // 4. Resume verification on-chain
+        // 4. Sign the verdict: "{data_id_hex}:{verdict_json}"
+        let scoped_message = format!("{}:{}", ve.data_id, verdict_json);
+        let verifier_sig = match sign_action_ed25519(&scoped_message, verifier_nsec) {
+            Ok(sig) => sig,
+            Err(e) => {
+                error!(job_id = %ve.job_id, error = %e, "failed to sign verdict");
+                continue;
+            }
+        };
+
+        // 5. Resume verification on-chain
         let resume_args = serde_json::json!({
             "data_id_hex": ve.data_id,
-            "verdict": verdict_json,
+            "verdict_json": verdict_json,
+            "verifier_index": verifier_index,
+            "signature": verifier_sig,
         });
 
         match super::send_function_call(
@@ -803,10 +821,19 @@ pub fn spawn_verifier_thread_with_health(
                 }
             };
 
-            info!(escrow = %escrow_contract, account = %signer.account_id, "verifier thread starting");
+            let verifier_nsec = match daemon_cfg.nostr_nsec.as_deref() {
+                Some(k) => k.to_string(),
+                None => {
+                    error!("nostr_nsec not configured, verifier thread exiting");
+                    return;
+                }
+            };
+            let verifier_index = daemon_cfg.verifier_index;
+
+            info!(escrow = %escrow_contract, account = %signer.account_id, verifier_index, "verifier thread starting");
 
             loop {
-                match run_verifier_cycle(&rpc, &rpc_url, &signer, &nonce_cache, &escrow_contract, &gemini_key, &processed) {
+                match run_verifier_cycle(&rpc, &rpc_url, &signer, &nonce_cache, &escrow_contract, &gemini_key, &processed, verifier_index, &verifier_nsec) {
                     Ok(count) => {
                         if count > 0 {
                             info!("verifier processed {} escrows", count);
