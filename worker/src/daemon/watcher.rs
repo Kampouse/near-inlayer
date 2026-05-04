@@ -85,3 +85,28 @@ pub(crate) fn spawn_block_watcher(network: &str, rpc_url: &str, poll_interval_se
         .expect("failed to spawn block watcher thread");
     rx
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_neardata_base_url_mainnet() {
+        assert_eq!(neardata_base_url("mainnet"), "https://neardata.xyz");
+    }
+
+    #[test]
+    fn test_neardata_base_url_testnet() {
+        assert_eq!(neardata_base_url("testnet"), "https://testnet.neardata.xyz");
+    }
+
+    #[test]
+    fn test_neardata_base_url_custom_network() {
+        assert_eq!(neardata_base_url("customnet"), "https://customnet.neardata.xyz");
+    }
+
+    #[test]
+    fn test_neardata_base_url_empty() {
+        assert_eq!(neardata_base_url(""), "https://.neardata.xyz");
+    }
+}

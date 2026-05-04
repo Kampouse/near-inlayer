@@ -211,3 +211,95 @@ pub(crate) fn is_receipt_used(receipt: &str) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── compute_challenge_hmac ─────────────────────────────────────────
+
+    #[test]
+    fn test_hmac_deterministic() {
+        let a = compute_challenge_hmac("id1", "1.0", "alice.near");
+        let b = compute_challenge_hmac("id1", "1.0", "alice.near");
+        assert_eq!(a, b, "same inputs must produce the same HMAC");
+    }
+
+    #[test]
+    fn test_hmac_differs_on_challenge_id() {
+        let a = compute_challenge_hmac("id1", "1.0", "alice.near");
+        let b = compute_challenge_hmac("id2", "1.0", "alice.near");
+        assert_ne!(a, b, "different challenge_id must produce different HMAC");
+    }
+
+    #[test]
+    fn test_hmac_differs_on_amount() {
+        let a = compute_challenge_hmac("id1", "1.0", "alice.near");
+        let b = compute_challenge_hmac("id1", "2.0", "alice.near");
+        assert_ne!(a, b, "different amount must produce different HMAC");
+    }
+
+    #[test]
+    fn test_hmac_differs_on_recipient() {
+        let a = compute_challenge_hmac("id1", "1.0", "alice.near");
+        let b = compute_challenge_hmac("id1", "1.0", "bob.near");
+        assert_ne!(a, b, "different recipient must produce different HMAC");
+    }
+
+    #[test]
+    fn test_hmac_empty_strings() {
+        let h = compute_challenge_hmac("", "", "");
+        assert!(!h.is_empty(), "HMAC should still produce output for empty inputs");
+        // Should be 16 hex chars (8 bytes truncated SHA-256)
+        assert_eq!(h.len(), 16, "HMAC is first 8 bytes in hex = 16 chars");
+    }
+
+    #[test]
+    fn test_hmac_long_strings() {
+        let long_id = "x".repeat(10_000);
+        let h = compute_challenge_hmac(&long_id, "1.0", "alice.near");
+        assert!(!h.is_empty(), "HMAC should handle long inputs");
+        assert_eq!(h.len(), 16);
+    }
+
+    #[test]
+    fn test_hmac_output_is_hex() {
+        let h = compute_challenge_hmac("id1", "1.0", "alice.near");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()), "HMAC output should be hex");
+    }
+
+    // ── get_used_receipts ───────────────────────────────────────────────
+
+    #[test]
+    fn test_get_used_receipts_returns_set() {
+        let set = get_used_receipts();
+        // The global may have been initialized by prior tests; just verify we
+        // can lock and interact with it.
+        let _guard = set.lock().unwrap();
+        // If we get here without panic, the OnceLock initialised correctly.
+    }
+
+    // ── is_receipt_used / mark_receipt_used ────────────────────────────
+
+    #[test]
+    fn test_receipt_replay_protection() {
+        // Use a unique receipt id to avoid interference with other tests.
+        let receipt = format!("test_receipt_{}_replay", std::process::id());
+
+        // After marking, it should appear as used.
+        mark_receipt_used(&receipt);
+        // is_receipt_used checks the same global USED_RECEIPTS.
+        assert!(is_receipt_used(&receipt), "receipt should be marked as used");
+
+        // Marking again should still show as used (idempotent).
+        mark_receipt_used(&receipt);
+        assert!(is_receipt_used(&receipt), "receipt should remain marked after double-mark");
+    }
+
+    #[test]
+    fn test_unused_receipt_not_found() {
+        let receipt = format!("test_receipt_{}_unused", std::process::id());
+        // This receipt was never marked — should not be found.
+        assert!(!is_receipt_used(&receipt), "unseen receipt should not be marked as used");
+    }
+}

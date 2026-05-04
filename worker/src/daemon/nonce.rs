@@ -57,6 +57,20 @@ impl NonceCache {
         Self { inner: Mutex::new(NonceCacheInner { nonce: None, block_hash: None }), rpc_url, signer }
     }
 
+    /// Create a NonceCache for unit tests (won't hit RPC unless reserve_batch is called).
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        use near_crypto::SecretKey;
+        Self {
+            inner: Mutex::new(NonceCacheInner { nonce: None, block_hash: None }),
+            rpc_url: "http://localhost:0".to_string(),
+            signer: InMemorySigner::from_secret_key(
+                "test.near".parse().unwrap(),
+                SecretKey::from_random(near_crypto::KeyType::ED25519),
+            ),
+        }
+    }
+
     pub(crate) fn reserve_batch(&self, count: usize) -> Result<(u64, CryptoHash)> {
         let mut inner = self.inner.lock().unwrap();
         if inner.nonce.is_none() {
@@ -217,5 +231,100 @@ pub(crate) fn resolve_batch(
             nonce_cache.invalidate();
             payloads.into_iter().map(|(id, _, _, _, _)| (id, Err(anyhow::anyhow!("batch resolve failed: {}", e)))).collect()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_for_test_creates_cache() {
+        let cache = NonceCache::new_for_test();
+        let inner = cache.inner.lock().unwrap();
+        assert!(inner.nonce.is_none());
+        assert!(inner.block_hash.is_none());
+    }
+
+    #[test]
+    fn test_prefill_sets_nonce_when_empty() {
+        let cache = NonceCache::new_for_test();
+        let hash = CryptoHash::default();
+        cache.prefill(42, hash);
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.nonce, Some(42));
+        assert_eq!(inner.block_hash, Some(hash));
+    }
+
+    #[test]
+    fn test_prefill_does_not_overwrite() {
+        let cache = NonceCache::new_for_test();
+        let hash = CryptoHash::default();
+        cache.prefill(10, hash);
+        cache.prefill(99, hash); // should be ignored
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.nonce, Some(10));
+    }
+
+    #[test]
+    fn test_invalidate_clears_cache() {
+        let cache = NonceCache::new_for_test();
+        let hash = CryptoHash::default();
+        cache.prefill(42, hash);
+        cache.invalidate();
+        let inner = cache.inner.lock().unwrap();
+        assert!(inner.nonce.is_none());
+        assert!(inner.block_hash.is_none());
+    }
+
+    #[test]
+    fn test_invalidate_on_already_empty() {
+        let cache = NonceCache::new_for_test();
+        cache.invalidate(); // should not panic
+        let inner = cache.inner.lock().unwrap();
+        assert!(inner.nonce.is_none());
+    }
+
+    #[test]
+    fn test_reserve_batch_increments() {
+        let cache = NonceCache::new_for_test();
+        let hash = CryptoHash::default();
+        cache.prefill(100, hash);
+
+        let (base1, _) = cache.reserve_batch(5).unwrap();
+        assert_eq!(base1, 100);
+
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.nonce, Some(105));
+        drop(inner);
+
+        let (base2, _) = cache.reserve_batch(3).unwrap();
+        assert_eq!(base2, 105);
+
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.nonce, Some(108));
+    }
+
+    #[test]
+    fn test_reserve_batch_after_invalidate_then_prefill() {
+        let cache = NonceCache::new_for_test();
+        let hash = CryptoHash::default();
+        cache.prefill(50, hash);
+        cache.invalidate();
+        cache.prefill(200, hash);
+
+        let (base, _) = cache.reserve_batch(2).unwrap();
+        assert_eq!(base, 200);
+    }
+
+    #[test]
+    fn test_resolve_batch_empty_payload() {
+        let cache = NonceCache::new_for_test();
+        let signer = InMemorySigner::from_secret_key(
+            "test.near".parse().unwrap(),
+            near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519),
+        );
+        let result = resolve_batch(&cache, &signer, "contract.testnet", vec![]);
+        assert!(result.is_empty());
     }
 }

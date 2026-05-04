@@ -40,7 +40,7 @@ mod payment;
 mod rpc_pool;
 mod tunnel;
 mod watcher;
-mod nostr;
+pub mod nostr;
 
 pub use manage::{DaemonConfig, load_signer};
 
@@ -192,7 +192,7 @@ static RATE_LIMITER: once_cell::sync::Lazy<Mutex<HashMap<String, Vec<u64>>>> =
 
 /// Validate input JSON for security before WASM execution.
 /// Returns Err(reason) if validation fails.
-fn validate_input(input: &serde_json::Value, config: &DaemonConfig) -> Result<(), String> {
+pub(crate) fn validate_input(input: &serde_json::Value, config: &DaemonConfig) -> Result<(), String> {
     // 1. "action" must be present
     let action = input.get("action").and_then(|v| v.as_str()).ok_or_else(|| "missing required field: action".to_string())?;
 
@@ -229,14 +229,19 @@ fn validate_input(input: &serde_json::Value, config: &DaemonConfig) -> Result<()
 }
 
 /// Check rate limit for a pubkey. Returns false if over limit.
-fn check_rate_limit(pubkey: &str, max_per_hour: usize) -> bool {
+pub(crate) fn check_rate_limit(pubkey: &str, max_per_hour: usize) -> bool {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let hour_ago = now_secs.saturating_sub(3600);
 
-    let mut map = RATE_LIMITER.lock().unwrap();
+    let mut map = RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    // Prune stale entries: remove timestamps older than 1 hour, then drop empty keys
+    map.retain(|_, timestamps| {
+        timestamps.retain(|&t| t > hour_ago);
+        !timestamps.is_empty()
+    });
     let timestamps = map.entry(pubkey.to_string()).or_default();
     timestamps.retain(|&t| t > hour_ago);
     if timestamps.len() >= max_per_hour {
@@ -247,7 +252,7 @@ fn check_rate_limit(pubkey: &str, max_per_hour: usize) -> bool {
 }
 
 /// Validate WASM output. Returns (validated_output, error_if_any).
-fn validate_output(output: &str, max_bytes: usize) -> Result<String, String> {
+pub(crate) fn validate_output(output: &str, max_bytes: usize) -> Result<String, String> {
     // Enforce max size
     if output.len() > max_bytes {
         return Err(format!("output exceeds max_output_bytes ({} > {})", output.len(), max_bytes));
@@ -267,7 +272,7 @@ fn validate_output(output: &str, max_bytes: usize) -> Result<String, String> {
 }
 
 /// Recursively strip values containing private key patterns from JSON.
-fn strip_sensitive_values(val: &mut serde_json::Value) {
+pub(crate) fn strip_sensitive_values(val: &mut serde_json::Value) {
     match val {
         serde_json::Value::Object(map) => {
             for v in map.values_mut() {
@@ -669,7 +674,7 @@ pub(crate) fn get_pending_ids(rpc: &rpc_pool::Rpc, contract: &str) -> anyhow::Re
 // ── Nostr event handlers ────────────────────────────────────────────────
 
 /// Dispatch incoming Nostr events to the appropriate handler.
-fn handle_nostr_event(
+pub(crate) fn handle_nostr_event(
     event: &nostr::NostrEvent,
     daemon_cfg: &DaemonConfig,
     signer: &InMemorySigner,
@@ -677,6 +682,14 @@ fn handle_nostr_event(
     rpc_url: &str,
     log: &mut dyn FnMut(&str),
 ) {
+    // ── Signature verification (C1 fix) ──
+    // Every event must have a valid Schnorr signature matching its pubkey.
+    // This prevents forged events from a compromised relay.
+    if let Err(e) = nostr::verify_nostr_event(event) {
+        log(&format!(" nostr REJECTED event: {}", e));
+        return;
+    }
+
     // Skip our own RESULT events to prevent feedback loops (allow DISPATCH from self)
     if event.kind != nostr::KIND_TASK {
         if let Some(ref nsec) = daemon_cfg.nostr_nsec {
@@ -730,7 +743,7 @@ fn handle_nostr_event(
 /// In escrow mode, the relayer thread handles submitting on-chain. The daemon
 /// just logs it here — no direct action needed.
 /// In direct/both mode, routes to the existing inlayer request_execution flow.
-fn handle_nostr_dispatch(
+pub(crate) fn handle_nostr_dispatch(
     event: &nostr::NostrEvent,
     daemon_cfg: &DaemonConfig,
     signer: &InMemorySigner,
@@ -768,7 +781,7 @@ fn handle_nostr_dispatch(
 /// Flow: extract worker msig tags → relay claim via msig → write KV → relay submit via msig → wait → publish 41005
 ///
 /// If worker msig tags are missing, falls back to daemon signer for claim+submit.
-fn handle_nostr_result_escrow(
+pub(crate) fn handle_nostr_result_escrow(
     event: &nostr::NostrEvent,
     daemon_cfg: &DaemonConfig,
     signer: &InMemorySigner,
@@ -1474,7 +1487,8 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
     // ── Nostr subscriber ───────────────────────────────────────────────
     let nostr_rx = daemon_cfg.nostr_relay.as_ref().map(|relay| {
-        let rx = nostr::spawn_nostr_subscriber(relay);
+        let relay_urls = vec![relay.clone()];
+        let rx = nostr::spawn_nostr_subscriber(relay_urls);
         log(&format!("Nostr subscriber started ({})", relay));
         if let Some(ref nsec) = daemon_cfg.nostr_nsec {
             if let Ok(npub) = nostr::npub_from_nsec(nsec) {
@@ -1734,3 +1748,365 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
     Ok(())
 }
+
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::nostr::{NostrEvent, KIND_TASK, KIND_RESULT, KIND_CLAIM, KIND_ACTION, KIND_CONFIRMED};
+
+    /// Helper to build a test NostrEvent.
+    fn make_event(kind: u64, content: &str, tags: Vec<Vec<String>>) -> NostrEvent {
+        // Build a properly signed event so signature verification passes (C1 fix)
+        const TEST_NSEC: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let json = super::nostr::build_signed_event(TEST_NSEC, kind, content, tags)
+            .expect("build_signed_event should work with test nsec");
+        serde_json::from_str(&json).expect("signed event should deserialize")
+    }
+
+    /// Helper to build a DaemonConfig for escrow mode testing.
+    fn escrow_config() -> DaemonConfig {
+        DaemonConfig {
+            execution_mode: "escrow".to_string(),
+            escrow_contract: Some("escrow.testnet".to_string()),
+            kv_account: Some("kv.testnet".to_string()),
+            nostr_relay: Some("wss://relay.testnet".to_string()),
+            nostr_nsec: None,
+            ..DaemonConfig::default()
+        }
+    }
+
+    /// Collector for log messages.
+    fn log_collector() -> (std::rc::Rc<std::cell::RefCell<Vec<String>>>, Box<dyn FnMut(&str)>) {
+        let logs = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let logs_clone = logs.clone();
+        let log_fn: Box<dyn FnMut(&str)> = Box::new(move |s: &str| {
+            logs_clone.borrow_mut().push(s.to_string());
+        });
+        (logs, log_fn)
+    }
+
+    // ── handle_nostr_event routing ─────────────────────────────────────
+
+    #[test]
+    fn test_handle_nostr_event_routes_task_to_dispatch() {
+        let cfg = escrow_config();
+        let event = make_event(KIND_TASK, r#"{"program":"kv-writer"}"#, vec![]);
+        let (logs, mut log_fn) = log_collector();
+
+        // This will fail on RPC/signer but should at least route (log "handle_nostr_dispatch")
+        handle_nostr_event(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("DISPATCH"), "KIND_TASK should route to dispatch. Logs: {}", msgs);
+    }
+
+    #[test]
+    fn test_handle_nostr_event_routes_result_to_escrow() {
+        let cfg = escrow_config();
+        let event = make_event(KIND_RESULT, r#"{"job_id":"j1","output":"done"}"#, vec![]);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_event(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("escrow") || msgs.contains("RESULT"), "KIND_RESULT in escrow mode should log escrow routing. Logs: {}", msgs);
+    }
+
+    #[test]
+    fn test_handle_nostr_event_ignores_unknown_kind() {
+        let cfg = escrow_config();
+        let event = make_event(99999, "{}", vec![]);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_event(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("unhandled"), "Unknown kind should log unhandled. Logs: {}", msgs);
+    }
+
+    // ── handle_nostr_result_escrow tag extraction ──────────────────────
+
+    #[test]
+    fn test_result_escrow_rejects_missing_job_id() {
+        let cfg = escrow_config();
+        let event = make_event(KIND_RESULT, r#"{"output":"done"}"#, vec![]);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_result_escrow(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("missing job_id"), "Should reject missing job_id. Logs: {}", msgs);
+    }
+
+    #[test]
+    fn test_result_escrow_rejects_empty_output() {
+        let cfg = escrow_config();
+        let event = make_event(KIND_RESULT, r#"{"job_id":"j1"}"#, vec![]);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_result_escrow(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("empty output"), "Should reject empty output. Logs: {}", msgs);
+    }
+
+    #[test]
+    fn test_result_escrow_rejects_invalid_json() {
+        let cfg = escrow_config();
+        let event = make_event(KIND_RESULT, "not json at all", vec![]);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_result_escrow(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("invalid JSON"), "Should reject invalid JSON. Logs: {}", msgs);
+    }
+
+    #[test]
+    fn test_result_escrow_extracts_worker_msig_tags() {
+        let cfg = escrow_config();
+        // Build event with worker msig tags
+        let tags = vec![
+            vec!["job_id".into(), "j-msig-001".into()],
+            vec!["worker_msig".into(), "worker.testnet".into()],
+            vec!["claim_action".into(), r#"{"nonce":1,"action":{"type":"claim","job_id":"j-msig-001"}}"#.into()],
+            vec!["claim_sig".into(), "aa".repeat(64)],  // 128 hex chars = 64 bytes
+            vec!["submit_action".into(), r#"{"nonce":2,"action":{"type":"submit_result","job_id":"j-msig-001"}}"#.into()],
+            vec!["submit_sig".into(), "bb".repeat(64)],
+        ];
+        let event = make_event(KIND_RESULT, r#"{"job_id":"j-msig-001","result":"task done"}"#, tags);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_result_escrow(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        // Should have extracted worker msig and attempted to run escrow job
+        assert!(msgs.contains("worker msig=worker.testnet"), "Should extract worker_msig tag. Logs: {}", msgs);
+    }
+
+    #[test]
+    fn test_result_escrow_job_id_from_tags_fallback() {
+        let cfg = escrow_config();
+        // Content has no job_id but tags do
+        let tags = vec![
+            vec!["job_id".into(), "j-tag-fallback".into()],
+        ];
+        let event = make_event(KIND_RESULT, r#"{"output":"done"}"#, tags);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_result_escrow(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        // Should have extracted job_id from tags (not rejected as missing)
+        assert!(!msgs.contains("missing job_id"), "Should extract job_id from tags. Logs: {}", msgs);
+        assert!(msgs.contains("j-tag-fallback"), "Should use tag job_id. Logs: {}", msgs);
+    }
+
+    #[test]
+    fn test_result_escrow_rejects_bad_claim_sig_hex() {
+        let cfg = escrow_config();
+        let tags = vec![
+            vec!["job_id".into(), "j-bad-sig".into()],
+            vec!["worker_msig".into(), "worker.testnet".into()],
+            vec!["claim_action".into(), "{}".into()],
+            vec!["claim_sig".into(), "NOT_HEX!!!".into()],  // bad hex
+            vec!["submit_action".into(), "{}".into()],
+            vec!["submit_sig".into(), "aa".repeat(64)],
+        ];
+        let event = make_event(KIND_RESULT, r#"{"job_id":"j-bad-sig","result":"x"}"#, tags);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_result_escrow(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("hex decode failed"), "Should reject bad claim_sig hex. Logs: {}", msgs);
+    }
+
+    #[test]
+    fn test_result_escrow_rejects_wrong_sig_length() {
+        let cfg = escrow_config();
+        let tags = vec![
+            vec!["job_id".into(), "j-sig-len".into()],
+            vec!["worker_msig".into(), "worker.testnet".into()],
+            vec!["claim_action".into(), "{}".into()],
+            vec!["claim_sig".into(), "aabb".into()],  // only 2 bytes, not 64
+            vec!["submit_action".into(), "{}".into()],
+            vec!["submit_sig".into(), "aa".repeat(64)],
+        ];
+        let event = make_event(KIND_RESULT, r#"{"job_id":"j-sig-len","result":"x"}"#, tags);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_result_escrow(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("wrong length"), "Should reject wrong sig length. Logs: {}", msgs);
+    }
+
+    #[test]
+    fn test_result_escrow_no_contract_configured() {
+        let mut cfg = escrow_config();
+        cfg.escrow_contract = None;
+        let tags = vec![vec!["job_id".into(), "j1".into()]];
+        let event = make_event(KIND_RESULT, r#"{"job_id":"j1","result":"done"}"#, tags);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_result_escrow(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("escrow_contract not configured"), "Should skip if no contract. Logs: {}", msgs);
+    }
+
+    // ── validate_input ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_input_rejects_missing_action() {
+        let cfg = DaemonConfig::default();
+        let input = serde_json::json!({"data": "no action field"});
+        assert!(validate_input(&input, &cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_input_rejects_unwhitelisted_action() {
+        let cfg = DaemonConfig::default();
+        let input = serde_json::json!({"action": "delete_everything"});
+        let err = validate_input(&input, &cfg).unwrap_err();
+        assert!(err.contains("not allowed"));
+    }
+
+    #[test]
+    fn test_validate_input_accepts_whitelisted_action() {
+        let cfg = DaemonConfig::default();
+        let input = serde_json::json!({"action": "write"});
+        assert!(validate_input(&input, &cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_input_rejects_signer_key_injection() {
+        let cfg = DaemonConfig::default();
+        let input = serde_json::json!({"action": "write", "signer_key": "sneaky"});
+        let err = validate_input(&input, &cfg).unwrap_err();
+        assert!(err.contains("signer_key"));
+    }
+
+    #[test]
+    fn test_validate_input_rejects_blocked_patterns() {
+        let cfg = DaemonConfig::default();
+        let input = serde_json::json!({"action": "write", "data": "my private_key is 1234"});
+        let err = validate_input(&input, &cfg).unwrap_err();
+        assert!(err.contains("blocked pattern"));
+    }
+
+    #[test]
+    fn test_validate_input_rejects_too_many_entries() {
+        let mut cfg = DaemonConfig::default();
+        cfg.max_entries = 2;
+        let input = serde_json::json!({
+            "action": "write",
+            "entries": {"a": 1, "b": 2, "c": 3}
+        });
+        let err = validate_input(&input, &cfg).unwrap_err();
+        assert!(err.contains("max_entries"));
+    }
+
+    // ── validate_output ────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_output_rejects_oversized() {
+        let err = validate_output(&"x".repeat(100), 50).unwrap_err();
+        assert!(err.contains("exceeds max_output_bytes"));
+    }
+
+    #[test]
+    fn test_validate_output_rejects_non_json() {
+        let err = validate_output("not json", 1_000_000).unwrap_err();
+        assert!(err.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn test_validate_output_accepts_valid_json() {
+        let result = validate_output(r#"{"success": true, "data": 42}"#, 1_000_000).unwrap();
+        assert!(result.contains("success"));
+    }
+
+    // ── strip_sensitive_values ─────────────────────────────────────────
+
+    #[test]
+    fn test_strip_sensitive_values_redacts_private_key() {
+        let mut val = serde_json::json!({
+            "key": "my private_key goes here",
+            "safe": "this is fine"
+        });
+        strip_sensitive_values(&mut val);
+        assert_eq!(val["key"], "[REDACTED]");
+        assert_eq!(val["safe"], "this is fine");
+    }
+
+    #[test]
+    fn test_strip_sensitive_values_redacts_mnemonic() {
+        let mut val = serde_json::json!({"data": " Mnemonic words "});
+        strip_sensitive_values(&mut val);
+        assert_eq!(val["data"], "[REDACTED]");
+    }
+
+    #[test]
+    fn test_strip_sensitive_values_redacts_seed_phrase() {
+        let mut val = serde_json::json!({"x": "contains seed_phrase somewhere"});
+        strip_sensitive_values(&mut val);
+        assert_eq!(val["x"], "[REDACTED]");
+    }
+
+    #[test]
+    fn test_strip_sensitive_values_handles_nested() {
+        let mut val = serde_json::json!({
+            "outer": {"inner": "my private_key"}
+        });
+        strip_sensitive_values(&mut val);
+        assert_eq!(val["outer"]["inner"], "[REDACTED]");
+    }
+
+    #[test]
+    fn test_strip_sensitive_values_handles_arrays() {
+        let mut val = serde_json::json!({
+            "items": ["safe", "private_key data", "also safe"]
+        });
+        strip_sensitive_values(&mut val);
+        assert_eq!(val["items"][0], "safe");
+        assert_eq!(val["items"][1], "[REDACTED]");
+        assert_eq!(val["items"][2], "also safe");
+    }
+
+    // ── check_rate_limit ───────────────────────────────────────────────
+
+    #[test]
+    fn test_check_rate_limit_allows_under_limit() {
+        // Just test that it returns true for a fresh pubkey
+        let result = check_rate_limit("pubkey_test_fresh_001", 100);
+        assert!(result, "First request should be allowed");
+    }
+
+    // ── handle_nostr_dispatch escrow mode ──────────────────────────────
+
+    #[test]
+    fn test_dispatch_escrow_mode_relays() {
+        let cfg = escrow_config();
+        let event = make_event(KIND_TASK, r#"{"program":"kv-writer"}"#, vec![]);
+        let (logs, mut log_fn) = log_collector();
+
+        handle_nostr_dispatch(&event, &cfg, &make_dummy_signer(), &nonce::NonceCache::new_for_test(), "http://rpc.testnet", &mut log_fn);
+
+        let msgs = logs.borrow().join(" ");
+        assert!(msgs.contains("relayer thread"), "Escrow mode should log relayer handling. Logs: {}", msgs);
+    }
+
+    /// Dummy signer for tests — doesn't need to be valid, just needs to exist.
+    fn make_dummy_signer() -> near_crypto::InMemorySigner {
+        near_crypto::InMemorySigner::from_secret_key(
+            "test.dummy.near".parse().unwrap(),
+            near_crypto::SecretKey::from_random(near_crypto::KeyType::ED25519),
+        )
+    }
+}
+

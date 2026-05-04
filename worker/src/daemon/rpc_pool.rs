@@ -115,3 +115,64 @@ impl Rpc {
         }).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rpc_new_single_url() {
+        let rpc = Rpc::new("https://rpc.testnet.near.org").unwrap();
+        assert_eq!(rpc.endpoints.len(), 1);
+        assert_eq!(rpc.endpoints[0].url, "https://rpc.testnet.near.org");
+        assert_eq!(rpc.endpoints[0].fails.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_rpc_from_urls_multiple() {
+        let urls = vec![
+            "https://rpc.fastnear.com".to_string(),
+            "https://near.drpc.org".to_string(),
+            "https://near.lava.build".to_string(),
+        ];
+        let rpc = Rpc::from_urls(urls.clone());
+        assert_eq!(rpc.endpoints.len(), 3);
+        for (i, url) in urls.iter().enumerate() {
+            assert_eq!(rpc.endpoints[i].url, *url);
+            assert_eq!(rpc.endpoints[i].fails.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn test_rpc_from_urls_empty() {
+        let rpc = Rpc::from_urls(vec![]);
+        assert_eq!(rpc.endpoints.len(), 0);
+    }
+
+    #[test]
+    fn test_rpc_from_urls_single() {
+        let rpc = Rpc::from_urls(vec!["https://example.com/rpc".to_string()]);
+        assert_eq!(rpc.endpoints.len(), 1);
+        assert_eq!(rpc.endpoints[0].url, "https://example.com/rpc");
+    }
+
+    #[test]
+    fn test_rpc_new_delegates_to_from_urls() {
+        let rpc = Rpc::new("https://rpc.example.com").unwrap();
+        // new() should produce the same result as from_urls with a single URL
+        let rpc2 = Rpc::from_urls(vec!["https://rpc.example.com".to_string()]);
+        assert_eq!(rpc.endpoints.len(), rpc2.endpoints.len());
+        assert_eq!(rpc.endpoints[0].url, rpc2.endpoints[0].url);
+    }
+
+    #[test]
+    fn test_endpoint_failure_tracking_independent() {
+        let rpc = Rpc::from_urls(vec![
+            "https://a.com".to_string(),
+            "https://b.com".to_string(),
+        ]);
+        rpc.endpoints[0].fails.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(rpc.endpoints[0].fails.load(Ordering::Relaxed), 3);
+        assert_eq!(rpc.endpoints[1].fails.load(Ordering::Relaxed), 0);
+    }
+}

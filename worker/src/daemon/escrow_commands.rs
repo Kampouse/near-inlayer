@@ -31,6 +31,7 @@ pub struct ThreadHealth {
     pub name: String,
     pub alive: AtomicBool,
     pub restart_count: AtomicBool, // u8 via AtomicBool — just tracking if restarted
+    pub is_recovering: AtomicBool, // true while a recovery thread is already running
 }
 
 impl ThreadHealth {
@@ -39,6 +40,7 @@ impl ThreadHealth {
             name: name.to_string(),
             alive: AtomicBool::new(true),
             restart_count: AtomicBool::new(false),
+            is_recovering: AtomicBool::new(false),
         })
     }
 
@@ -77,21 +79,27 @@ pub fn spawn_supervisor(
                 // Check relayer
                 if relayer_health.check_and_reset() {
                     relayer_missed = 0;
+                    relayer_health.is_recovering.store(false, Ordering::Relaxed);
                 } else {
                     relayer_missed += 1;
                     if relayer_missed >= max_missed {
-                        warn!("relayer silent for {} checks — restarting", relayer_missed);
-                        relayer_missed = 0;
-                        let cfg = config_dir.clone();
-                        let health = relayer_health.clone();
-                        std::thread::spawn(move || {
-                            info!("spawning new relayer thread");
-                            let handle = spawn_relayer_thread(cfg);
-                            health.ping(); // Mark alive on spawn
-                            let _ = handle.join();
-                            info!("relayer thread exited");
-                        });
-                        relayer_health.restart_count.store(true, Ordering::Relaxed);
+                        if relayer_health.is_recovering.load(Ordering::Relaxed) {
+                            warn!("relayer still recovering — skipping duplicate spawn");
+                        } else {
+                            warn!("relayer silent for {} checks — restarting", relayer_missed);
+                            relayer_health.is_recovering.store(true, Ordering::Relaxed);
+                            relayer_missed = 0;
+                            let cfg = config_dir.clone();
+                            let health = relayer_health.clone();
+                            std::thread::spawn(move || {
+                                info!("spawning new relayer thread");
+                                let handle = spawn_relayer_thread(cfg);
+                                health.ping(); // Mark alive on spawn
+                                let _ = handle.join();
+                                info!("relayer thread exited");
+                            });
+                            relayer_health.restart_count.store(true, Ordering::Relaxed);
+                        }
                     } else if relayer_missed > 1 {
                         warn!("relayer missed {} heartbeat(s)", relayer_missed);
                     }
@@ -101,21 +109,30 @@ pub fn spawn_supervisor(
                 if let Some(ref vh) = verifier_health {
                     if vh.check_and_reset() {
                         verifier_missed = 0;
+                        vh.is_recovering.store(false, Ordering::Relaxed);
                     } else {
                         verifier_missed += 1;
                         if verifier_missed >= max_missed {
-                            warn!("verifier silent for {} checks — restarting", verifier_missed);
-                            verifier_missed = 0;
-                            let cfg = config_dir.clone();
-                            let health = vh.clone();
-                            std::thread::spawn(move || {
-                                info!("spawning new verifier thread");
-                                let handle = spawn_verifier_thread(cfg);
-                                health.ping();
-                                let _ = handle.join();
-                                info!("verifier thread exited");
-                            });
-                            vh.restart_count.store(true, Ordering::Relaxed);
+                            if vh.is_recovering.load(Ordering::Relaxed) {
+                                warn!("verifier still recovering — skipping duplicate spawn");
+                            } else {
+                                warn!(
+                                    "verifier silent for {} checks — restarting",
+                                    verifier_missed
+                                );
+                                vh.is_recovering.store(true, Ordering::Relaxed);
+                                verifier_missed = 0;
+                                let cfg = config_dir.clone();
+                                let health = vh.clone();
+                                std::thread::spawn(move || {
+                                    info!("spawning new verifier thread");
+                                    let handle = spawn_verifier_thread(cfg);
+                                    health.ping();
+                                    let _ = handle.join();
+                                    info!("verifier thread exited");
+                                });
+                                vh.restart_count.store(true, Ordering::Relaxed);
+                            }
                         } else if verifier_missed > 1 {
                             warn!("verifier missed {} heartbeat(s)", verifier_missed);
                         }
@@ -130,7 +147,7 @@ pub fn spawn_supervisor(
 
 /// Ed25519 sign a JSON string for msig.execute().
 /// Key format: "ed25519:<base58>" or raw hex bytes.
-fn sign_action_ed25519(action_json: &str, private_key_str: &str) -> Result<Vec<u8>> {
+pub(crate) fn sign_action_ed25519(action_json: &str, private_key_str: &str) -> Result<Vec<u8>> {
     let seed = if private_key_str.starts_with("ed25519:") {
         let b58 = private_key_str.trim_start_matches("ed25519:");
         bs58::decode(b58).into_vec()?
@@ -429,7 +446,7 @@ fn run_verifier_cycle(
     for ve in verifying {
         // Dedup
         {
-            let mut p = processed.lock().unwrap();
+            let mut p = processed.lock().unwrap_or_else(|e| e.into_inner());
             if p.iter().any(|id| id == &ve.job_id) { continue; }
             p.push_back(ve.job_id.clone());
             while p.len() > 10_000 { p.pop_front(); }
@@ -547,7 +564,7 @@ struct PassResult {
 }
 
 /// Build the scoring prompt. Same prompt for all passes — temperature variation provides diversity.
-fn build_scoring_prompt(
+pub(crate) fn build_scoring_prompt(
     task_description: &str,
     criteria: &str,
     result: &str,
@@ -811,6 +828,214 @@ pub fn spawn_verifier_thread_with_health(
         .expect("failed to spawn verifier thread")
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// WORKER RESULT HANDLER (kind 41002)
+// ════════════════════════════════════════════════════════════════════════
+
+/// Handle kind 41002 (WORKER_RESULT) — extract worker-signed claim_for and
+/// submit_result_for actions from the Nostr event, relay them on-chain.
+///
+/// The event carries:
+///   - claim_sig:  ed25519 signature for the claim_for message
+///   - submit_sig: ed25519 signature for the submit_result_for message
+///   - job_id, worker_msig, patch_id, etc.
+///
+/// The relayer calls escrow.claim_for() then escrow.submit_result_for()
+/// directly on the escrow contract using the daemon's NEAR key.
+fn handle_worker_result_event(
+    event: &super::nostr::NostrEvent,
+    rpc_url: &str,
+    signer: &InMemorySigner,
+    nonce_cache: &NonceCache,
+    daemon_cfg: &DaemonConfig,
+    health: Option<&Arc<ThreadHealth>>,
+) {
+    let escrow_contract = match daemon_cfg.escrow_contract.as_deref() {
+        Some(c) => c,
+        None => {
+            error!("escrow_contract not configured, cannot process 41002");
+            return;
+        }
+    };
+
+    // Extract required tags
+    let job_id = event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == "job_id")
+        .and_then(|t| t.get(1))
+        .cloned()
+        .unwrap_or_default();
+
+    if job_id.is_empty() {
+        warn!("41002 missing job_id tag, skipping");
+        return;
+    }
+
+    let worker_pubkey = event.pubkey.clone();
+
+    let claim_sig_hex = event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == "claim_sig")
+        .and_then(|t| t.get(1))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    let submit_sig_hex = event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == "submit_sig")
+        .and_then(|t| t.get(1))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    let result_content = event.content.clone();
+    let patch_id = event
+        .tags
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == "patch_id")
+        .and_then(|t| t.get(1))
+        .cloned()
+        .unwrap_or_default();
+
+    info!(
+        job_id = %job_id,
+        worker = &worker_pubkey[..8.min(worker_pubkey.len())],
+        "👷 relayer processing WORKER_RESULT (41002)"
+    );
+
+    // ── Step 1: claim_for ──────────────────────────────────────────────
+    if !claim_sig_hex.is_empty() {
+        let claim_sig = match hex::decode(claim_sig_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(job_id = %job_id, error = %e, "invalid claim_sig hex");
+                return;
+            }
+        };
+
+        if claim_sig.len() != 64 {
+            warn!(
+                job_id = %job_id,
+                len = claim_sig.len(),
+                "claim_sig must be 64 bytes"
+            );
+            return;
+        }
+
+        let claim_args = serde_json::json!({
+            "job_id": job_id,
+            "worker_pubkey": worker_pubkey,
+            "worker_signature": claim_sig,
+        });
+
+        match super::send_function_call(
+            rpc_url,
+            signer,
+            escrow_contract,
+            "claim_for",
+            &claim_args,
+            100_000_000_000_000, // 100 Tgas
+            0,
+            nonce_cache,
+        ) {
+            Ok((tx_hash, _)) => {
+                info!(
+                    tx = &&tx_hash[..16.min(tx_hash.len())],
+                    "claim_for submitted on-chain"
+                );
+            }
+            Err(e) => {
+                // Don't return — claim_for might fail because the escrow
+                // was already claimed (idempotent re-submission). Try submit anyway.
+                warn!(
+                    job_id = %job_id,
+                    error = %e,
+                    "claim_for failed (may be already claimed, continuing)"
+                );
+            }
+        }
+    } else {
+        info!(
+            job_id = %job_id,
+            "no claim_sig in 41002, skipping claim_for (escrow may be pre-claimed)"
+        );
+    }
+
+    // ── Step 2: submit_result_for ──────────────────────────────────────
+    if submit_sig_hex.is_empty() {
+        warn!(
+            job_id = %job_id,
+            "41002 missing submit_sig, cannot submit result"
+        );
+        return;
+    }
+
+    let submit_sig = match hex::decode(submit_sig_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(job_id = %job_id, error = %e, "invalid submit_sig hex");
+            return;
+        }
+    };
+
+    if submit_sig.len() != 64 {
+        warn!(
+            job_id = %job_id,
+            len = submit_sig.len(),
+            "submit_sig must be 64 bytes"
+        );
+        return;
+    }
+
+    // Use patch_id as result reference if content is short, else content itself
+    let result_ref = if !patch_id.is_empty() {
+        format!("{{\"patch_id\":\"{}\",\"summary\":{}}}", patch_id, serde_json::to_string(&result_content).unwrap_or_default())
+    } else {
+        result_content.clone()
+    };
+
+    let submit_args = serde_json::json!({
+        "job_id": job_id,
+        "result": result_ref,
+        "worker_pubkey": worker_pubkey,
+        "worker_signature": submit_sig,
+    });
+
+    match super::send_function_call(
+        rpc_url,
+        signer,
+        escrow_contract,
+        "submit_result_for",
+        &submit_args,
+        200_000_000_000_000, // 200 Tgas (triggers yield, needs headroom)
+        0,
+        nonce_cache,
+    ) {
+        Ok((tx_hash, _)) => {
+            info!(
+                tx = &&tx_hash[..16.min(tx_hash.len())],
+                "submit_result_for submitted on-chain"
+            );
+        }
+        Err(e) => {
+            error!(
+                job_id = %job_id,
+                error = %e,
+                "submit_result_for FAILED"
+            );
+            return;
+        }
+    }
+
+    // Heartbeat
+    if let Some(h) = health {
+        h.ping();
+    }
+
+    info!(job_id = %job_id, "worker result relayed on-chain successfully");
+}
 /// Internal relayer loop — shared by CLI cmd_relayer and daemon thread.
 fn run_relayer_inner(
     daemon_cfg: &DaemonConfig,
@@ -826,7 +1051,7 @@ fn run_relayer_inner(
 
     info!(relay = %relay, account = %signer.account_id, "relayer starting, watching kinds 41000,41003");
 
-    let rx = super::nostr::spawn_nostr_subscriber(relay);
+    let rx = super::nostr::spawn_nostr_subscriber(vec![relay.to_string()]);
     info!("relayer subscribed, waiting for events");
 
     loop {
@@ -834,10 +1059,19 @@ fn run_relayer_inner(
             Ok(ev) => ev,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                warn!("Nostr subscriber disconnected, relayer exiting");
+                error!("Nostr subscriber channel disconnected, relayer exiting to avoid tight-loop");
                 break;
             }
         };
+
+        // ── Route by kind ──────────────────────────────────────────────
+        if event.kind == super::nostr::KIND_RESULT {
+            // Kind 41002 — WORKER_RESULT
+            handle_worker_result_event(
+                &event, &rpc_url, signer, nonce_cache, daemon_cfg, health,
+            );
+            continue;
+        }
 
         if event.kind != super::nostr::KIND_TASK && event.kind != super::nostr::KIND_ACTION {
             continue;
@@ -845,7 +1079,7 @@ fn run_relayer_inner(
 
         // Dedup
         {
-            let mut p = processed.lock().unwrap();
+            let mut p = processed.lock().unwrap_or_else(|e| e.into_inner());
             if p.iter().any(|id| id == &event.id) { continue; }
             p.push_back(event.id.clone());
             while p.len() > 10_000 { p.pop_front(); }
@@ -990,4 +1224,197 @@ fn run_relayer_inner(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── sign_action_ed25519 ─────────────────────────────────────────────
+
+    /// Generate a valid 32-byte seed for testing.
+    fn test_seed_hex() -> String {
+        hex::encode([42u8; 32])
+    }
+
+    /// Generate a valid 64-byte (seed+pubkey) for testing.
+    fn test_seed64_hex() -> String {
+        hex::encode([42u8; 64])
+    }
+
+    #[test]
+    fn test_sign_with_raw_hex_32_bytes() {
+        let key = test_seed_hex();
+        let sig = sign_action_ed25519(r#"{"test":true}"#, &key);
+        assert!(sig.is_ok(), "32-byte hex key should be accepted");
+        let sig = sig.unwrap();
+        assert_eq!(sig.len(), 64, "Ed25519 signature must be 64 bytes");
+    }
+
+    #[test]
+    fn test_sign_with_raw_hex_64_bytes() {
+        let key = test_seed64_hex();
+        let sig = sign_action_ed25519(r#"{"test":true}"#, &key);
+        assert!(sig.is_ok(), "64-byte hex key should be accepted (uses first 32 bytes)");
+        let sig = sig.unwrap();
+        assert_eq!(sig.len(), 64, "Ed25519 signature must be 64 bytes");
+    }
+
+    #[test]
+    fn test_sign_deterministic() {
+        let key = test_seed_hex();
+        let msg = r#"{"action":"test","nonce":1}"#;
+        let sig1 = sign_action_ed25519(msg, &key).unwrap();
+        let sig2 = sign_action_ed25519(msg, &key).unwrap();
+        assert_eq!(sig1, sig2, "same key + message must produce identical signatures");
+    }
+
+    #[test]
+    fn test_sign_different_messages_differ() {
+        let key = test_seed_hex();
+        let sig1 = sign_action_ed25519(r#"{"msg":1}"#, &key).unwrap();
+        let sig2 = sign_action_ed25519(r#"{"msg":2}"#, &key).unwrap();
+        assert_ne!(sig1, sig2, "different messages must produce different signatures");
+    }
+
+    #[test]
+    fn test_sign_with_ed25519_prefix() {
+        // Encode the 32-byte seed as base58 with "ed25519:" prefix
+        let seed_bytes = [42u8; 32];
+        let b58 = bs58::encode(seed_bytes).into_string();
+        let key = format!("ed25519:{}", b58);
+        let sig = sign_action_ed25519(r#"{"test":true}"#, &key);
+        assert!(sig.is_ok(), "ed25519:<base58> key should be accepted");
+    }
+
+    #[test]
+    fn test_sign_ed25519_prefix_matches_raw_hex() {
+        let seed_bytes = [42u8; 32];
+        let b58 = bs58::encode(seed_bytes).into_string();
+        let prefixed_key = format!("ed25519:{}", b58);
+        let raw_hex_key = hex::encode(seed_bytes);
+
+        let msg = r#"{"test":true}"#;
+        let sig_prefixed = sign_action_ed25519(msg, &prefixed_key).unwrap();
+        let sig_raw = sign_action_ed25519(msg, &raw_hex_key).unwrap();
+        assert_eq!(sig_prefixed, sig_raw, "ed25519: prefix and raw hex should produce same signature");
+    }
+
+    #[test]
+    fn test_sign_invalid_key_length() {
+        // 16 bytes — too short
+        let key = hex::encode([0u8; 16]);
+        let result = sign_action_ed25519("test", &key);
+        assert!(result.is_err(), "wrong key length should fail");
+    }
+
+    #[test]
+    fn test_sign_empty_key() {
+        let result = sign_action_ed25519("test", "");
+        assert!(result.is_err(), "empty key should fail");
+    }
+
+    #[test]
+    fn test_sign_invalid_hex() {
+        let result = sign_action_ed25519("test", "not_hex_at_all!!!");
+        assert!(result.is_err(), "invalid hex should fail");
+    }
+
+    // ── build_scoring_prompt ────────────────────────────────────────────
+
+    #[test]
+    fn test_scoring_prompt_contains_task_description() {
+        let prompt = build_scoring_prompt("Build a web scraper", "Must be fast", "Result here", 80);
+        assert!(prompt.contains("Build a web scraper"), "prompt should contain task description");
+    }
+
+    #[test]
+    fn test_scoring_prompt_contains_criteria() {
+        let prompt = build_scoring_prompt("Task", "Must pass all tests", "Result", 80);
+        assert!(prompt.contains("Must pass all tests"), "prompt should contain criteria");
+    }
+
+    #[test]
+    fn test_scoring_prompt_contains_result() {
+        let prompt = build_scoring_prompt("Task", "Criteria", "The actual work output", 80);
+        assert!(prompt.contains("The actual work output"), "prompt should contain result");
+    }
+
+    #[test]
+    fn test_scoring_prompt_contains_threshold() {
+        let prompt = build_scoring_prompt("Task", "Criteria", "Result", 75);
+        assert!(prompt.contains("75"), "prompt should contain threshold value");
+    }
+
+    #[test]
+    fn test_scoring_prompt_contains_scoring_instructions() {
+        let prompt = build_scoring_prompt("Task", "Criteria", "Result", 80);
+        assert!(prompt.contains("score"), "prompt should mention score");
+        assert!(prompt.contains("impartial"), "prompt should mention impartial verifier");
+        assert!(prompt.contains("reasoning"), "prompt should request reasoning");
+    }
+
+    #[test]
+    fn test_scoring_prompt_contains_json_format() {
+        let prompt = build_scoring_prompt("Task", "Criteria", "Result", 80);
+        assert!(prompt.contains("JSON"), "prompt should specify JSON response format");
+    }
+
+    // ── ThreadHealth ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_thread_health_new_is_alive() {
+        // ThreadHealth::new sets alive = true initially
+        let health = ThreadHealth::new("test-thread");
+        // check_and_reset returns the current value and sets to false
+        assert!(health.check_and_reset(), "new ThreadHealth should be alive (true)");
+    }
+
+    #[test]
+    fn test_thread_health_ping_then_check() {
+        let health = ThreadHealth::new("test-thread");
+        // Reset first (new starts true)
+        let _ = health.check_and_reset();
+        // Now alive should be false
+        assert!(!health.check_and_reset(), "after reset, should be false");
+
+        // Ping
+        health.ping();
+        assert!(health.check_and_reset(), "after ping, should be true");
+    }
+
+    #[test]
+    fn test_thread_health_check_resets_to_false() {
+        let health = ThreadHealth::new("test-thread");
+        // First check returns true (initial value) and resets to false
+        assert!(health.check_and_reset());
+        // Second check should return false
+        assert!(!health.check_and_reset(), "check_and_reset should have cleared the flag");
+    }
+
+    #[test]
+    fn test_thread_health_no_ping_means_timeout() {
+        let health = ThreadHealth::new("test-thread");
+        // Consume the initial true
+        let _ = health.check_and_reset();
+        // Without calling ping(), repeated checks return false (simulating a dead thread)
+        assert!(!health.check_and_reset());
+        assert!(!health.check_and_reset());
+    }
+
+    #[test]
+    fn test_thread_health_ping_multiple_times() {
+        let health = ThreadHealth::new("test-thread");
+        health.ping();
+        health.ping();
+        // Only one check should return true, then false
+        assert!(health.check_and_reset());
+        assert!(!health.check_and_reset());
+    }
+
+    #[test]
+    fn test_thread_health_name() {
+        let health = ThreadHealth::new("my-worker-thread");
+        assert_eq!(health.name, "my-worker-thread");
+    }
 }

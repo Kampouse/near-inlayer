@@ -42,7 +42,7 @@ mod status {
 }
 
 /// Terminal statuses — job is done, no more polling needed.
-fn is_terminal(status: &str) -> bool {
+pub(crate) fn is_terminal(status: &str) -> bool {
     matches!(
         status,
         status::CLAIMED | status::REFUNDED | status::CANCELLED | status::SETTLEMENT_FAILED
@@ -62,7 +62,7 @@ pub struct EscrowView {
     pub score_threshold: u8,
 }
 
-fn default_threshold() -> u8 {
+pub(crate) fn default_threshold() -> u8 {
     80
 }
 
@@ -496,4 +496,95 @@ pub fn run_escrow_job(
         tx_hash_result,
         tx_hash_kv,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── is_terminal ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_terminal_claimed() {
+        assert!(is_terminal("Claimed"));
+    }
+
+    #[test]
+    fn test_terminal_refunded() {
+        assert!(is_terminal("Refunded"));
+    }
+
+    #[test]
+    fn test_terminal_cancelled() {
+        assert!(is_terminal("Cancelled"));
+    }
+
+    #[test]
+    fn test_terminal_settlement_failed() {
+        assert!(is_terminal("SettlementFailed"));
+    }
+
+    #[test]
+    fn test_not_terminal_pending_funding() {
+        assert!(!is_terminal("PendingFunding"));
+    }
+
+    #[test]
+    fn test_not_terminal_open() {
+        assert!(!is_terminal("Open"));
+    }
+
+    #[test]
+    fn test_not_terminal_in_progress() {
+        assert!(!is_terminal("InProgress"));
+    }
+
+    #[test]
+    fn test_not_terminal_verifying() {
+        assert!(!is_terminal("Verifying"));
+    }
+
+    #[test]
+    fn test_not_terminal_garbage() {
+        assert!(!is_terminal("garbage"));
+        assert!(!is_terminal(""));
+        assert!(!is_terminal("random_status"));
+    }
+
+    // ── default_threshold ───────────────────────────────────────────────
+
+    #[test]
+    fn test_default_threshold_value() {
+        assert_eq!(default_threshold(), 80);
+    }
+
+    // ── KvReference roundtrip ──────────────────────────────────────────
+
+    #[test]
+    fn test_kv_reference_serialization_roundtrip() {
+        let kv = KvReference {
+            kv_account: "kv.test.near".to_string(),
+            kv_predecessor: "worker.test.near".to_string(),
+            kv_key: "result/job-42".to_string(),
+        };
+        let json = kv.to_json();
+        let parsed: KvReference = serde_json::from_str(&json).expect("roundtrip deserialize");
+        assert_eq!(parsed.kv_account, "kv.test.near");
+        assert_eq!(parsed.kv_predecessor, "worker.test.near");
+        assert_eq!(parsed.kv_key, "result/job-42");
+    }
+
+    #[test]
+    fn test_kv_reference_json_contains_fields() {
+        let kv = KvReference {
+            kv_account: "kv.test.near".to_string(),
+            kv_predecessor: "worker.test.near".to_string(),
+            kv_key: "result/job-99".to_string(),
+        };
+        let json = kv.to_json();
+        assert!(json.contains("kv_account"), "JSON should contain kv_account");
+        assert!(json.contains("kv_predecessor"), "JSON should contain kv_predecessor");
+        assert!(json.contains("kv_key"), "JSON should contain kv_key");
+        assert!(json.contains("result/job-99"), "JSON should contain the key value");
+    }
 }

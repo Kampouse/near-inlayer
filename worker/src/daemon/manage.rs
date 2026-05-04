@@ -205,6 +205,7 @@ impl DaemonConfig {
                 if let Ok(s) = std::fs::read_to_string(&path) {
                     if let Ok(mut cfg) = toml::from_str::<DaemonConfig>(&s) {
                         cfg.expand_tildes();
+                        cfg.apply_env_overrides();
                         tracing::info!("📁 Using config from: {}", path.display());
                         return cfg;
                     } else {
@@ -221,6 +222,7 @@ impl DaemonConfig {
                 if let Ok(s) = std::fs::read_to_string(&path) {
                     if let Ok(mut cfg) = toml::from_str::<DaemonConfig>(&s) {
                         cfg.expand_tildes();
+                        cfg.apply_env_overrides();
                         tracing::info!("📁 Using config from: {}", path.display());
                         return cfg;
                     }
@@ -235,10 +237,11 @@ impl DaemonConfig {
                 let path = home_config_dir.join(name);
                 if path.exists() {
                     if let Ok(s) = std::fs::read_to_string(&path) {
-                        if let Ok(mut cfg) = toml::from_str::<DaemonConfig>(&s) {
-                            cfg.expand_tildes();
-                            tracing::info!("📁 Using global config from: {}", path.display());
-                            return cfg;
+                    if let Ok(mut cfg) = toml::from_str::<DaemonConfig>(&s) {
+                        cfg.expand_tildes();
+                        cfg.apply_env_overrides();
+                        tracing::info!("📁 Using global config from: {}", path.display());
+                        return cfg;
                         }
                     }
                 }
@@ -259,6 +262,7 @@ impl DaemonConfig {
 
         let mut cfg = DaemonConfig::default();
         cfg.expand_tildes();
+        cfg.apply_env_overrides();
         cfg
     }
 
@@ -273,6 +277,17 @@ impl DaemonConfig {
                     *dir = format!("{}/{}", home_str, &dir[2..]);
                 }
             }
+        }
+    }
+
+    /// Apply environment variable overrides (H1 fix).
+    /// Env vars take precedence over config file values.
+    fn apply_env_overrides(&mut self) {
+        if let Ok(val) = std::env::var("INLAYER_NOSTR_NSEC") {
+            self.nostr_nsec = Some(val);
+        }
+        if let Ok(val) = std::env::var("INLAYER_NOSTR_RELAY") {
+            self.nostr_relay = Some(val);
         }
     }
 
@@ -496,4 +511,230 @@ pub(crate) fn parse_dashboard_flag(args: &[String]) -> Option<String> {
 pub(crate) fn now() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── DaemonConfig::validate() ──────────────────────────────────────────
+
+    #[test]
+    fn test_validate_rejects_placeholder_account() {
+        let cfg = DaemonConfig::default();
+        // default has "your-account" in account_id
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("not set up"), "expected placeholder message, got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_rejects_missing_key_file() {
+        let mut cfg = DaemonConfig::default();
+        cfg.account_id = "real-account.testnet".to_string();
+        cfg.key_path = "/nonexistent/path/key.json".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("Key file not found"), "expected key file error, got: {}", err);
+    }
+
+    // ── DaemonConfig::rpc_urls() ──────────────────────────────────────────
+
+    #[test]
+    fn test_rpc_urls_mainnet() {
+        let cfg = DaemonConfig { network: "mainnet".to_string(), ..DaemonConfig::default() };
+        let urls = cfg.rpc_urls();
+        assert!(urls.contains(&"https://rpc.fastnear.com".to_string()));
+        assert!(urls.contains(&"https://near.drpc.org".to_string()));
+        assert_eq!(urls.len(), 5);
+    }
+
+    #[test]
+    fn test_rpc_urls_testnet() {
+        let cfg = DaemonConfig { network: "testnet".to_string(), ..DaemonConfig::default() };
+        let urls = cfg.rpc_urls();
+        assert!(urls.contains(&"https://rpc.testnet.fastnear.com".to_string()));
+        assert_eq!(urls.len(), 3);
+    }
+
+    #[test]
+    fn test_rpc_urls_unknown_network() {
+        let cfg = DaemonConfig { network: "mycustomnet".to_string(), ..DaemonConfig::default() };
+        let urls = cfg.rpc_urls();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "https://rpc.mycustomnet.near.org");
+    }
+
+    // ── deserialize_yocto ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_deserialize_yocto_from_integer() {
+        #[derive(Deserialize)]
+        struct Wrap { #[serde(deserialize_with = "deserialize_yocto")] val: u128 }
+        let toml_str = "val = 42\n";
+        let w: Wrap = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.val, 42u128);
+    }
+
+    #[test]
+    fn test_deserialize_yocto_from_string() {
+        #[derive(Deserialize)]
+        struct Wrap { #[serde(deserialize_with = "deserialize_yocto")] val: u128 }
+        let toml_str = "val = \"1000000000000000000000000\"\n";
+        let w: Wrap = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.val, 1_000_000_000_000_000_000_000_000u128);
+    }
+
+    #[test]
+    fn test_deserialize_yocto_from_zero() {
+        #[derive(Deserialize)]
+        struct Wrap { #[serde(deserialize_with = "deserialize_yocto")] val: u128 }
+        let toml_str = "val = 0\n";
+        let w: Wrap = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.val, 0u128);
+    }
+
+    #[test]
+    fn test_deserialize_yocto_invalid_string() {
+        #[derive(Deserialize)]
+        struct Wrap { #[serde(deserialize_with = "deserialize_yocto")] val: u128 }
+        let toml_str = "val = \"not_a_number\"\n";
+        let result = toml::from_str::<Wrap>(toml_str);
+        assert!(result.is_err());
+    }
+
+    // ── default_worker_stake ──────────────────────────────────────────────
+
+    #[test]
+    fn test_default_worker_stake_value() {
+        assert_eq!(default_worker_stake(), 100_000_000_000_000_000_000_000u128);
+    }
+
+    #[test]
+    fn test_config_default_worker_stake() {
+        let cfg = DaemonConfig::default();
+        assert_eq!(cfg.worker_stake_yocto, default_worker_stake());
+    }
+
+    // ── expand_tildes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_expand_tildes_key_path() {
+        let home = dirs::home_dir();
+        if home.is_none() { return; } // skip in envs without home
+        let home = home.unwrap();
+        let mut cfg = DaemonConfig {
+            key_path: "~/my-keys/test.json".to_string(),
+            search_paths: vec![],
+            ..DaemonConfig::default()
+        };
+        cfg.expand_tildes();
+        assert_eq!(cfg.key_path, format!("{}/my-keys/test.json", home.display()));
+        assert!(!cfg.key_path.starts_with("~"));
+    }
+
+    #[test]
+    fn test_expand_tildes_absolute_path_unchanged() {
+        let mut cfg = DaemonConfig {
+            key_path: "/absolute/path/key.json".to_string(),
+            search_paths: vec![],
+            ..DaemonConfig::default()
+        };
+        cfg.expand_tildes();
+        assert_eq!(cfg.key_path, "/absolute/path/key.json");
+    }
+
+    #[test]
+    fn test_expand_tildes_search_paths() {
+        let home = dirs::home_dir();
+        if home.is_none() { return; }
+        let home = home.unwrap();
+        let mut cfg = DaemonConfig {
+            key_path: "/tmp/key.json".to_string(),
+            search_paths: vec!["~/projects/wasm".to_string(), "/opt/wasm".to_string()],
+            ..DaemonConfig::default()
+        };
+        cfg.expand_tildes();
+        assert_eq!(cfg.search_paths[0], format!("{}/projects/wasm", home.display()));
+        assert_eq!(cfg.search_paths[1], "/opt/wasm"); // no tilde → unchanged
+    }
+
+    #[test]
+    fn test_expand_tildes_no_tilde_unchanged() {
+        let mut cfg = DaemonConfig {
+            key_path: "relative/path/key.json".to_string(),
+            search_paths: vec!["./local".to_string()],
+            ..DaemonConfig::default()
+        };
+        cfg.expand_tildes();
+        assert_eq!(cfg.key_path, "relative/path/key.json");
+        assert_eq!(cfg.search_paths[0], "./local");
+    }
+
+    // ── parse_dashboard_flag ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_dashboard_flag_present() {
+        let args: Vec<String> = ["inlayer", "--dashboard", "0.0.0.0:8080"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_dashboard_flag(&args), Some("0.0.0.0:8080".to_string()));
+    }
+
+    #[test]
+    fn test_parse_dashboard_flag_absent() {
+        let args: Vec<String> = ["inlayer", "--foreground"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_dashboard_flag(&args), None);
+    }
+
+    #[test]
+    fn test_parse_dashboard_flag_no_value() {
+        let args: Vec<String> = ["inlayer", "--dashboard"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_dashboard_flag(&args), None);
+    }
+
+    #[test]
+    fn test_parse_dashboard_flag_empty_args() {
+        let args: Vec<String> = vec![];
+        assert_eq!(parse_dashboard_flag(&args), None);
+    }
+
+    // ── now() ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_now_returns_nonempty() {
+        let t = now();
+        assert!(!t.is_empty());
+        // Format: HH:MM:SS (8 chars)
+        assert_eq!(t.len(), 8);
+        assert!(t.contains(':'));
+    }
+
+    #[test]
+    fn test_now_format_valid() {
+        let t = now();
+        let parts: Vec<&str> = t.split(':').collect();
+        assert_eq!(parts.len(), 3);
+        let h: u32 = parts[0].parse().unwrap();
+        let m: u32 = parts[1].parse().unwrap();
+        let s: u32 = parts[2].parse().unwrap();
+        assert!(h < 24);
+        assert!(m < 60);
+        assert!(s < 60);
+    }
+
+    // ── DaemonConfig defaults ─────────────────────────────────────────────
+
+    #[test]
+    fn test_default_config_values() {
+        let cfg = DaemonConfig::default();
+        assert_eq!(cfg.network, "testnet");
+        assert_eq!(cfg.poll_interval_secs, 5);
+        assert_eq!(cfg.deposit_yocto, 1u128);
+        assert_eq!(cfg.execution_mode, "direct");
+        assert!(cfg.escrow_contract.is_none());
+        assert!(cfg.kv_account.is_none());
+        assert_eq!(cfg.max_entries, 100);
+        assert_eq!(cfg.max_output_bytes, 1_000_000);
+        assert!(!cfg.agent_pays);
+    }
 }
