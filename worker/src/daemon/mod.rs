@@ -366,6 +366,21 @@ pub(crate) fn resolve_wasm(source: &ParsedSource, config: &DaemonConfig) -> Opti
 
 /// Find WASM locally by URL filename, then fall back to download.
 fn resolve_wasm_from_url(url: &str, expected_hash: &str) -> Option<Vec<u8>> {
+    // If the URL is a local file path, read it directly
+    if url.starts_with('/') || url.starts_with("./") || url.starts_with("~/") {
+        let expanded = if url.starts_with("~/") {
+            dirs::home_dir().map(|h| h.join(&url[2..]))
+        } else {
+            Some(std::path::PathBuf::from(url))
+        };
+        if let Some(path) = expanded {
+            if path.exists() {
+                tracing::info!("📂 Reading local WASM: {}", path.display());
+                return fs::read(&path).ok();
+            }
+        }
+    }
+
     // Extract filename from URL (e.g. "nostr-identity-zkp-tee-wasip2.wasm")
     let filename = url.rsplit('/').next().unwrap_or("");
 

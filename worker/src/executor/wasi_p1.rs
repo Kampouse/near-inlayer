@@ -83,6 +83,9 @@ pub async fn execute(
     let mut linker = wasmtime::Linker::new(engine);
     preview1::add_to_linker_async(&mut linker, |t: &mut WasiP1Ctx| t)?;
 
+    // Add outlayer http host functions
+    add_outlayer_http(&mut linker)?;
+
     // Prepare stdin/stdout pipes
     let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
     let stdout_pipe =
@@ -208,4 +211,152 @@ pub async fn execute(
 
     // P1 does not support payment host functions, so refund_usd is always None
     Ok((output, fuel_consumed, None))
+}
+
+/// Add outlayer HTTP host functions (http_get, http_post) to the linker.
+///
+/// These let WASM modules make HTTP requests via reqwest.
+/// Signature: http_get(url_ptr, url_len, headers_ptr, headers_len, result_ptr, result_len_ptr) -> errno
+/// Signature: http_post(url_ptr, url_len, body_ptr, body_len, headers_ptr, headers_len, result_ptr, result_len_ptr) -> errno
+fn add_outlayer_http(linker: &mut wasmtime::Linker<WasiP1Ctx>) -> Result<()> {
+    // outlayer::http_get(url_ptr, url_len, _hdr_ptr, _hdr_len, result_ptr, result_len_ptr) -> errno
+    linker.func_wrap("outlayer", "http_get",
+        |mut caller: Caller<'_, WasiP1Ctx>,
+         url_ptr: i32, url_len: i32,
+         _hdr_ptr: i32, _hdr_len: i32,
+         r_ptr: i32, rl_ptr: i32| -> i32 {
+
+        let mem = caller.get_export("memory")
+            .and_then(|e| e.into_memory())
+            .expect("no memory export");
+        let data = mem.data(&caller);
+        if (url_ptr as usize) + (url_len as usize) > data.len() {
+            tracing::error!("[outlayer::http_get] url out of bounds");
+            return 1;
+        }
+        let url = String::from_utf8_lossy(&data[url_ptr as usize..(url_ptr as usize + url_len as usize)]);
+
+        debug!("[outlayer::http_get] url={}", url);
+
+        // We're inside an async wasmtime context — use tokio::task::block_in_place
+        // to avoid blocking the tokio runtime
+        let response = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                reqwest::Client::new()
+                    .get(&*url)
+                    .header("User-Agent", "OutLayer/1.0")
+                    .send()
+                    .await
+            })
+        });
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                let bytes = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async { resp.bytes().await })
+                });
+                match bytes {
+                    Ok(bytes) => {
+                        debug!("[outlayer::http_get] HTTP {} ({} bytes)", status.as_u16(), bytes.len());
+                        // Write result length first, then copy bytes
+                        let data = mem.data_mut(&mut caller);
+                        let len_bytes = (bytes.len() as i32).to_le_bytes();
+                        if (rl_ptr as usize) + 4 <= data.len() {
+                            data[rl_ptr as usize..rl_ptr as usize + 4].copy_from_slice(&len_bytes);
+                        }
+                        if (r_ptr as usize) + bytes.len() <= data.len() {
+                            data[r_ptr as usize..r_ptr as usize + bytes.len()].copy_from_slice(&bytes);
+                        } else {
+                            tracing::error!("[outlayer::http_get] result buffer too small: need {} have {}", bytes.len(), data.len() - r_ptr as usize);
+                            return 2;
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        tracing::error!("[outlayer::http_get] body read error: {}", e);
+                        1
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("[outlayer::http_get] HTTP error: {}", e);
+                1
+            }
+        }
+    })?;
+
+    // outlayer::http_post(url_ptr, url_len, body_ptr, body_len, _hdr_ptr, _hdr_len, result_ptr, result_len_ptr) -> errno
+    linker.func_wrap("outlayer", "http_post",
+        |mut caller: Caller<'_, WasiP1Ctx>,
+         url_ptr: i32, url_len: i32,
+         body_ptr: i32, body_len: i32,
+         _hdr_ptr: i32, _hdr_len: i32,
+         r_ptr: i32, rl_ptr: i32| -> i32 {
+
+        let mem = caller.get_export("memory")
+            .and_then(|e| e.into_memory())
+            .expect("no memory export");
+        let data = mem.data(&caller);
+        if (url_ptr as usize) + (url_len as usize) > data.len() {
+            return 1;
+        }
+        let url = String::from_utf8_lossy(&data[url_ptr as usize..(url_ptr as usize + url_len as usize)]);
+        let body = if body_len > 0 && (body_ptr as usize) + (body_len as usize) <= data.len() {
+            String::from_utf8_lossy(&data[body_ptr as usize..(body_ptr as usize + body_len as usize)]).to_string()
+        } else {
+            String::new()
+        };
+
+        debug!("[outlayer::http_post] url={} body_len={}", url, body.len());
+
+        let response = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                reqwest::Client::new()
+                    .post(&*url)
+                    .header("User-Agent", "OutLayer/1.0")
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+            })
+        });
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                let bytes = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async { resp.bytes().await })
+                });
+                match bytes {
+                    Ok(bytes) => {
+                        debug!("[outlayer::http_post] HTTP {} ({} bytes)", status.as_u16(), bytes.len());
+                        let data = mem.data_mut(&mut caller);
+                        let len_bytes = (bytes.len() as i32).to_le_bytes();
+                        if (rl_ptr as usize) + 4 <= data.len() {
+                            data[rl_ptr as usize..rl_ptr as usize + 4].copy_from_slice(&len_bytes);
+                        }
+                        if (r_ptr as usize) + bytes.len() <= data.len() {
+                            data[r_ptr as usize..r_ptr as usize + bytes.len()].copy_from_slice(&bytes);
+                        } else {
+                            tracing::error!("[outlayer::http_post] result buffer too small");
+                            return 2;
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        tracing::error!("[outlayer::http_post] body read error: {}", e);
+                        1
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("[outlayer::http_post] HTTP error: {}", e);
+                1
+            }
+        }
+    })?;
+
+    debug!("✅ Added outlayer http host functions (http_get, http_post)");
+    Ok(())
 }

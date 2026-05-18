@@ -95,6 +95,9 @@ pub struct DaemonConfig {
     pub escrow_settle_timeout_secs: u64,
     /// Default WASM URL for submit when --wasm-url is not provided
     pub default_wasm_url: Option<String>,
+    /// Named programs: map of name → URL or local path
+    #[serde(default)]
+    pub programs: std::collections::HashMap<String, String>,
 }
 
 impl Default for DaemonConfig {
@@ -131,6 +134,7 @@ impl Default for DaemonConfig {
             escrow_fund_timeout_secs: 600,
             escrow_settle_timeout_secs: 600,
             default_wasm_url: None,
+            programs: std::collections::HashMap::new(),
         }
     }
 }

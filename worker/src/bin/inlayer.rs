@@ -262,14 +262,17 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
     use base64::Engine;
 
     if extra_args.first().map_or(false, |s| s == "--help") {
-        eprintln!("Usage: inlayer submit [input_json] [--wasm-url <url>] [--contract <id>] [--account <id>] [--network <net>]");
+        eprintln!("Usage: inlayer submit [program] [input_json] [--wasm-url <url>] [--contract <id>]");
         eprintln!();
-        eprintln!("All values default to ~/.inlayer/inlayer.config or ./inlayer.config");
+        eprintln!("  program       Named program from config [programs] table");
         eprintln!("  input_json    JSON input (default: {{}})");
-        eprintln!("  --wasm-url    WASM binary URL (default: from config default_wasm_url)");
-        eprintln!("  --contract    Contract ID (default: from config)");
-        eprintln!("  --account     Account ID (default: from config)");
-        eprintln!("  --network     Network: mainnet/testnet (default: from config)");
+        eprintln!("  --wasm-url    WASM binary URL (overrides program/default)");
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  inlayer submit                  # default program, default input");
+        eprintln!("  inlayer submit lisp-rlm         # named program from config");
+        eprintln!("  inlayer submit lisp-rlm '{{\"x\":1}}'  # named program + input");
+        eprintln!("  inlayer submit --wasm-url ...   # explicit URL");
         std::process::exit(0);
     }
 
@@ -279,7 +282,8 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
     );
     let cfg = offchainvm_worker::daemon::manage::DaemonConfig::load(&config_dir);
 
-    // Parse args — config values as defaults, env vars override, CLI flags override all
+    // Parse args: [program] [input_json] [--flags ...]
+    let mut program: Option<String> = None;
     let mut input = "{}".to_string();
     let mut contract_id: Option<String> = None;
     let mut account_id: Option<String> = None;
@@ -287,6 +291,7 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
     let mut wasm_url: Option<String> = None;
     let mut deposit_str: Option<String> = None;
 
+    let mut positional = Vec::new();
     let mut i = 0;
     while i < extra_args.len() {
         match extra_args[i].as_str() {
@@ -295,9 +300,50 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
             "--network" if i + 1 < extra_args.len() => { network = Some(extra_args[i + 1].clone()); i += 2; }
             "--wasm-url" if i + 1 < extra_args.len() => { wasm_url = Some(extra_args[i + 1].clone()); i += 2; }
             "--deposit" if i + 1 < extra_args.len() => { deposit_str = Some(extra_args[i + 1].clone()); i += 2; }
-            other => { input = other.to_string(); i += 1; }
+            other => { positional.push(other.to_string()); i += 1; }
         }
     }
+
+    // First positional: program name OR input JSON (starts with '{')
+    // Second positional: input JSON
+    for arg in &positional {
+        if arg.starts_with('{') {
+            input = arg.clone();
+        } else if program.is_none() {
+            program = Some(arg.clone());
+        } else {
+            input = arg.clone();
+        }
+    }
+
+    // Resolve wasm_url: CLI > env > program lookup > local file > default_wasm_url > error
+    let wasm_url = wasm_url
+        .or_else(|| std::env::var("INLAYER_WASM_URL").ok())
+        .or_else(|| {
+            // Look up program name in config [programs] table
+            program.as_ref().and_then(|name| cfg.programs.get(name).cloned())
+        })
+        .or_else(|| {
+            // Check if program arg is a local .wasm file → pass absolute path directly
+            program.as_ref().and_then(|name| {
+                let path = std::path::Path::new(name);
+                if path.exists() && path.extension().map(|e| e == "wasm").unwrap_or(false) {
+                    let abs = std::fs::canonicalize(path).ok()?;
+                    eprintln!("   📦 Using local: {}", abs.display());
+                    Some(abs.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| cfg.default_wasm_url.clone())
+        .unwrap_or_else(|| {
+            eprintln!("Error: provide a program name, local .wasm file, or --wasm-url");
+            if !cfg.programs.is_empty() {
+                eprintln!("  Available programs: {}", cfg.programs.keys().cloned().collect::<Vec<_>>().join(", "));
+            }
+            std::process::exit(1);
+        });
 
     // Resolution order: CLI flag > env var > config > error
     let contract_id = contract_id
@@ -309,23 +355,17 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
     let network = network
         .or_else(|| std::env::var("INLAYER_NETWORK").ok())
         .unwrap_or_else(|| cfg.network.clone());
-    let wasm_url = wasm_url
-        .or_else(|| std::env::var("INLAYER_WASM_URL").ok())
-        .or_else(|| cfg.default_wasm_url.clone())
-        .unwrap_or_else(|| {
-            eprintln!("Error: --wasm-url required (or set default_wasm_url in config)");
-            std::process::exit(1);
-        });
     let deposit_str = deposit_str
         .or_else(|| std::env::var("INLAYER_DEPOSIT").ok())
         .unwrap_or_else(|| "0.01".to_string());
 
-    let deposit: f64 = deposit_str.parse().context("invalid deposit amount")?;
-    let deposit_yocto = (deposit * 1e24) as u128;
-
     eprintln!("📤 Submitting to {}...", contract_id);
+    if let Some(ref prog) = program { eprintln!("   Program: {}", prog); }
     eprintln!("   Input: {}", input);
     eprintln!("   Account: {}", account_id);
+
+    let deposit: f64 = deposit_str.parse().context("invalid deposit amount")?;
+    let deposit_yocto = (deposit * 1e24) as u128;
 
     let input_b64 = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
 

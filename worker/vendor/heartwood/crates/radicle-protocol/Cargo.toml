@@ -1,0 +1,38 @@
+[package]
+name = "radicle-protocol"
+description = "The Radicle Protocol"
+homepage.workspace = true
+license.workspace = true
+version = "0.7.0"
+authors = ["Radicle Team <team@radicle.xyz>"]
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+test = ["radicle/test", "radicle-crypto/test", "radicle-crypto/cyphernet", "qcheck"]
+
+[dependencies]
+bloomy = "1.2"
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+cypheraddr = { workspace = true, features = ["serde", "tor"] }
+fastrand = { workspace = true }
+log = { workspace = true, features = ["std"] }
+nonempty = { workspace = true, features = ["serialize"] }
+qcheck = { workspace = true, optional = true }
+radicle = { workspace = true, features = ["logger"] }
+radicle-core = { workspace = true }
+radicle-fetch = { workspace = true }
+radicle-localtime = { workspace = true }
+sqlite = { workspace = true, features = ["bundled"] }
+scrypt = { version = "0.11.0", default-features = false }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror = { workspace = true, default-features = true }
+
+[dev-dependencies]
+paste = "1.0.15"
+qcheck = { workspace = true }
+qcheck-macros = { workspace = true }
+radicle = { workspace = true, features = ["test"] }
+radicle-crypto = { workspace = true, features = ["test", "cyphernet"] }
