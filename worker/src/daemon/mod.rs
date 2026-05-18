@@ -259,9 +259,14 @@ pub(crate) fn validate_output(output: &str, max_bytes: usize) -> Result<String, 
         return Err(format!("output exceeds max_output_bytes ({} > {})", output.len(), max_bytes));
     }
 
-    // Must be valid JSON with "success" boolean
-    let mut parsed: serde_json::Value = serde_json::from_str(output)
-        .map_err(|e| format!("output is not valid JSON: {}", e))?;
+    // Must be valid JSON — if not, wrap raw output as a JSON string
+    let mut parsed: serde_json::Value = match serde_json::from_str(output) {
+        Ok(v) => v,
+        Err(_) => {
+            // Raw text output — wrap it
+            serde_json::json!({ "success": true, "output": output })
+        }
+    };
 
     if parsed.get("success").and_then(|v| v.as_bool()).is_none() {
         // Not a hard error — some outputs don't have this field. Just log.
@@ -776,6 +781,16 @@ pub(crate) fn handle_nostr_event(
             handle_nostr_dispatch(event, daemon_cfg, signer, nonce_cache, rpc_url, log);
         }
         nostr::KIND_RESULT => {
+            // Skip our own nostr results — we already resolved on-chain via poll
+            let own_pubkey = daemon_cfg.nostr_nsec.as_ref().and_then(|nsec| {
+                nostr::npub_from_nsec(nsec).ok()
+            });
+            if let Some(ref pk) = own_pubkey {
+                if event.pubkey == *pk {
+                    log(&format!(" nostr RESULT from self ({}...) — skipping", &event.pubkey[..8.min(event.pubkey.len())]));
+                    return;
+                }
+            }
             log(&format!(" nostr RESULT from {}...", &event.pubkey[..8.min(event.pubkey.len())]));
             match daemon_cfg.execution_mode.as_str() {
                 "escrow" => {
@@ -1238,8 +1253,13 @@ fn handle_nostr_result(
             }
         }
         Err(e) => {
-            log(&format!("   resolve_execution FAILED for job={}: {}", job_id, e));
-            nonce_cache.invalidate();
+            let err_str = e.to_string();
+            if err_str.contains("not found") {
+                log(&format!("   resolve_execution job={} already resolved, skipping", job_id));
+            } else {
+                log(&format!("   resolve_execution FAILED for job={}: {}", job_id, e));
+                nonce_cache.invalidate();
+            }
         }
     }
 }
