@@ -261,57 +261,71 @@ fn cfg_env(key: &str, default: &str) -> String {
 fn cmd_submit(extra_args: &[String]) -> Result<()> {
     use base64::Engine;
 
-    if extra_args.is_empty() || extra_args[0] == "--help" {
-        eprintln!("Usage: inlayer submit <input_json> [--contract <id>] [--account <id>] [--network <net>] [--wasm-url <url>]");
-        eprintln!("       Env: INLAYER_CONTRACT, INLAYER_ACCOUNT, INLAYER_NETWORK, INLAYER_WASM_URL, INLAYER_DEPOSIT");
+    if extra_args.first().map_or(false, |s| s == "--help") {
+        eprintln!("Usage: inlayer submit [input_json] [--wasm-url <url>] [--contract <id>] [--account <id>] [--network <net>]");
         eprintln!();
-        eprintln!("Submits an execution request to the OutLayer contract.");
-        eprintln!("layerd will pick it up and execute it.");
+        eprintln!("All values default to ~/.inlayer/inlayer.config or ./inlayer.config");
+        eprintln!("  input_json    JSON input (default: {{}})");
+        eprintln!("  --wasm-url    WASM binary URL (default: from config default_wasm_url)");
+        eprintln!("  --contract    Contract ID (default: from config)");
+        eprintln!("  --account     Account ID (default: from config)");
+        eprintln!("  --network     Network: mainnet/testnet (default: from config)");
         std::process::exit(0);
     }
 
-    // Parse args
-    let mut input = extra_args[0].clone();
-    let mut contract_id: Option<String> = std::env::var("INLAYER_CONTRACT").ok();
-    let mut account_id: Option<String> = std::env::var("INLAYER_ACCOUNT").ok();
-    let mut network: Option<String> = std::env::var("INLAYER_NETWORK").ok();
-    let mut wasm_url: Option<String> = std::env::var("INLAYER_WASM_URL").ok();
-    let mut deposit_str = env_or("INLAYER_DEPOSIT", "0.01");
+    // Load config from standard paths (CWD → config_dir → ~/.inlayer/)
+    let config_dir = std::path::PathBuf::from(
+        std::env::var("INLAYER_CONFIG_DIR").unwrap_or_else(|_| ".".into())
+    );
+    let cfg = offchainvm_worker::daemon::manage::DaemonConfig::load(&config_dir);
 
-    let mut i = 1;
+    // Parse args — config values as defaults, env vars override, CLI flags override all
+    let mut input = "{}".to_string();
+    let mut contract_id: Option<String> = None;
+    let mut account_id: Option<String> = None;
+    let mut network: Option<String> = None;
+    let mut wasm_url: Option<String> = None;
+    let mut deposit_str: Option<String> = None;
+
+    let mut i = 0;
     while i < extra_args.len() {
         match extra_args[i].as_str() {
             "--contract" if i + 1 < extra_args.len() => { contract_id = Some(extra_args[i + 1].clone()); i += 2; }
             "--account" if i + 1 < extra_args.len() => { account_id = Some(extra_args[i + 1].clone()); i += 2; }
             "--network" if i + 1 < extra_args.len() => { network = Some(extra_args[i + 1].clone()); i += 2; }
             "--wasm-url" if i + 1 < extra_args.len() => { wasm_url = Some(extra_args[i + 1].clone()); i += 2; }
-            "--deposit" if i + 1 < extra_args.len() => { deposit_str = extra_args[i + 1].clone(); i += 2; }
+            "--deposit" if i + 1 < extra_args.len() => { deposit_str = Some(extra_args[i + 1].clone()); i += 2; }
             other => { input = other.to_string(); i += 1; }
         }
     }
 
-    let contract_id = contract_id.unwrap_or_else(|| {
-        eprintln!("Error: --contract or INLAYER_CONTRACT required");
-        std::process::exit(1);
-    });
-    let account_id = account_id.unwrap_or_else(|| {
-        eprintln!("Error: --account or INLAYER_ACCOUNT required");
-        std::process::exit(1);
-    });
-    let network = network.unwrap_or_else(|| "testnet".to_string());
-    let wasm_url = wasm_url.unwrap_or_else(|| {
-        eprintln!("Error: --wasm-url or INLAYER_WASM_URL required");
-        std::process::exit(1);
-    });
-
-    let rpc_url = match network.as_str() {
-        "mainnet" => "https://rpc.fastnear.com".to_string(),
-        "testnet" => "https://test.rpc.fastnear.com".to_string(),
-        other => other.to_string(),
-    };
+    // Resolution order: CLI flag > env var > config > error
+    let contract_id = contract_id
+        .or_else(|| std::env::var("INLAYER_CONTRACT").ok())
+        .unwrap_or_else(|| cfg.contract_id.clone());
+    let account_id = account_id
+        .or_else(|| std::env::var("INLAYER_ACCOUNT").ok())
+        .unwrap_or_else(|| cfg.account_id.clone());
+    let network = network
+        .or_else(|| std::env::var("INLAYER_NETWORK").ok())
+        .unwrap_or_else(|| cfg.network.clone());
+    let wasm_url = wasm_url
+        .or_else(|| std::env::var("INLAYER_WASM_URL").ok())
+        .or_else(|| cfg.default_wasm_url.clone())
+        .unwrap_or_else(|| {
+            eprintln!("Error: --wasm-url required (or set default_wasm_url in config)");
+            std::process::exit(1);
+        });
+    let deposit_str = deposit_str
+        .or_else(|| std::env::var("INLAYER_DEPOSIT").ok())
+        .unwrap_or_else(|| "0.01".to_string());
 
     let deposit: f64 = deposit_str.parse().context("invalid deposit amount")?;
     let deposit_yocto = (deposit * 1e24) as u128;
+
+    eprintln!("📤 Submitting to {}...", contract_id);
+    eprintln!("   Input: {}", input);
+    eprintln!("   Account: {}", account_id);
 
     let input_b64 = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
 
@@ -332,10 +346,6 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
     });
     let args_bytes = serde_json::to_vec(&args_json)?;
 
-    eprintln!("📤 Submitting to {}...", contract_id);
-    eprintln!("   Input: {}", input);
-    eprintln!("   Account: {}", account_id);
-
     let rpc_pool: Vec<String> = match network.as_str() {
         "mainnet" => vec![
             "https://rpc.fastnear.com".into(),
@@ -349,7 +359,7 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
             "https://neart.lava.build".into(),
             "https://near-testnet.gateway.tatum.io".into(),
         ],
-        _ => vec![rpc_url.clone()],
+        _ => vec![format!("https://rpc.{}.near.org", network)],
     };
 
     let rt = tokio::runtime::Runtime::new()?;

@@ -34,7 +34,7 @@ use crate::outlayer_rpc::RpcProxy;
 mod api;
 mod escrow_client;
 pub mod escrow_commands;
-mod manage;
+pub mod manage;
 mod nonce;
 mod payment;
 pub mod radicle_client;

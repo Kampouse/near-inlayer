@@ -93,6 +93,8 @@ pub struct DaemonConfig {
     pub escrow_fund_timeout_secs: u64,
     /// Timeout in seconds to wait for escrow settlement after result submission (default: 600)
     pub escrow_settle_timeout_secs: u64,
+    /// Default WASM URL for submit when --wasm-url is not provided
+    pub default_wasm_url: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -128,6 +130,7 @@ impl Default for DaemonConfig {
             worker_stake_yocto: default_worker_stake(),
             escrow_fund_timeout_secs: 600,
             escrow_settle_timeout_secs: 600,
+            default_wasm_url: None,
         }
     }
 }
