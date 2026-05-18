@@ -106,7 +106,7 @@ impl Default for DaemonConfig {
                 "{}/.near-credentials/testnet/your-account.testnet.json",
                 home.display()
             ),
-            poll_interval_secs: 5,
+            poll_interval_secs: 2,
             dashboard_addr: None,
             search_paths: vec!["./wasi-examples".to_string()],
             tunnel_url: None,

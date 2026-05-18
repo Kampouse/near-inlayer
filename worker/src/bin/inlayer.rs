@@ -305,7 +305,7 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
     });
 
     let rpc_url = match network.as_str() {
-        "mainnet" => "https://rpc.mainnet.near.org".to_string(),
+        "mainnet" => "https://rpc.fastnear.com".to_string(),
         "testnet" => "https://test.rpc.fastnear.com".to_string(),
         other => other.to_string(),
     };
@@ -336,60 +336,163 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
     eprintln!("   Input: {}", input);
     eprintln!("   Account: {}", account_id);
 
+    let rpc_pool: Vec<String> = match network.as_str() {
+        "mainnet" => vec![
+            "https://rpc.fastnear.com".into(),
+            "https://near.drpc.org".into(),
+            "https://near.lava.build".into(),
+            "https://near-rpc.publicnode.com".into(),
+            "https://near-mainnet.api.pagoda.co/rpc/v1".into(),
+        ],
+        "testnet" => vec![
+            "https://rpc.testnet.fastnear.com".into(),
+            "https://neart.lava.build".into(),
+            "https://near-testnet.gateway.tatum.io".into(),
+        ],
+        _ => vec![rpc_url.clone()],
+    };
+
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let client = JsonRpcClient::connect(&rpc_url);
-        let signer = find_signer(&account_id, &network)?;
+    let mut last_err = String::new();
 
-        let query_response = client
-            .call(near_jsonrpc_client::methods::query::RpcQueryRequest {
-                block_reference: BlockReference::latest(),
-                request: QueryRequest::ViewAccessKey { account_id: account_id.parse()?, public_key: signer.public_key() },
-            })
-            .await
-            .context("query access key failed")?;
-
-        let nonce = match query_response.kind {
-            QueryResponseKind::AccessKey(ak) => ak.nonce,
-            _ => anyhow::bail!("unexpected query response"),
-        };
-
-        let transaction = TransactionV0 {
-            signer_id: account_id.parse()?,
-            public_key: signer.public_key.clone(),
-            nonce: nonce + 1,
-            receiver_id: contract_id.parse()?,
-            block_hash: query_response.block_hash,
-            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                method_name: "request_execution".into(),
-                args: args_bytes,
-                gas: 100_000_000_000_000,
-                deposit: deposit_yocto,
-            }))],
-        };
-
-        let signed_tx = Transaction::V0(transaction).sign(&near_crypto::Signer::InMemory(signer));
-        let tx_hash = signed_tx.get_hash();
-
-        let result = client
-            .call(near_jsonrpc_client::methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
-                signed_transaction: signed_tx,
-            })
-            .await
-            .context("broadcast tx failed")?;
-
-        match &result.status {
-            near_primitives::views::FinalExecutionStatus::Failure(e) => {
-                anyhow::bail!("Transaction failed: {:?}", e);
-            }
-            near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {}
-            _ => {}
+    'retry: for (attempt, rpc_endpoint) in rpc_pool.iter().cycle().enumerate() {
+        if attempt > 0 && attempt % rpc_pool.len() == 0 {
+            eprintln!("   ... retrying RPC ({}/{})", attempt / rpc_pool.len() + 1, 3);
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
+        if attempt >= rpc_pool.len() * 3 { break 'retry; }
 
-        eprintln!("✅ Submitted! tx: {}", tx_hash);
-        eprintln!("   layerd will pick it up automatically.");
-        Ok(())
-    })
+        rt.block_on(async {
+            let client = JsonRpcClient::connect(rpc_endpoint.as_str());
+            let signer = match find_signer(&account_id, &network) {
+                Ok(s) => s,
+                Err(e) => { last_err = e.to_string(); return; }
+            };
+
+            let query_response = match client
+                .call(near_jsonrpc_client::methods::query::RpcQueryRequest {
+                    block_reference: BlockReference::latest(),
+                    request: QueryRequest::ViewAccessKey { account_id: account_id.parse().unwrap(), public_key: signer.public_key() },
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("rate limit") || msg.contains("exceeded") || msg.contains("Too many") {
+                        last_err = msg;
+                        return;
+                    }
+                    last_err = msg;
+                    return;
+                }
+            };
+
+            let nonce = match query_response.kind {
+                QueryResponseKind::AccessKey(ak) => ak.nonce,
+                _ => { last_err = "unexpected query response".into(); return; }
+            };
+
+            let transaction = TransactionV0 {
+                signer_id: account_id.parse().unwrap(),
+                public_key: signer.public_key.clone(),
+                nonce: nonce + 1,
+                receiver_id: contract_id.parse().unwrap(),
+                block_hash: query_response.block_hash,
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "request_execution".into(),
+                    args: args_bytes.clone(),
+                    gas: 100_000_000_000_000,
+                    deposit: deposit_yocto,
+                }))],
+            };
+
+            let signed_tx = Transaction::V0(transaction).sign(&near_crypto::Signer::InMemory(signer));
+            let tx_hash = signed_tx.get_hash();
+
+            match client
+                .call(near_jsonrpc_client::methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+                    signed_transaction: signed_tx,
+                })
+                .await
+            {
+                Ok(result) => {
+                    match &result.status {
+                        near_primitives::views::FinalExecutionStatus::Failure(e) => {
+                            last_err = format!("{:?}", e);
+                            return;
+                        }
+                        _ => {}
+                    }
+
+                    eprintln!("✅ Submitted! tx: {}", tx_hash);
+                    // success — continue to poll below
+                    // NOTE: we break out of the retry loop by setting a flag
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("rate limit") || msg.contains("exceeded") || msg.contains("Too many") {
+                        last_err = msg;
+                        return;
+                    }
+                    last_err = msg;
+                    return;
+                }
+            };
+
+            // ... poll for result ...
+            let dashboard_url = "http://127.0.0.1:8082/api/history";
+            let baseline_count: usize = match reqwest::get(dashboard_url).await {
+                Ok(resp) => match resp.text().await {
+                    Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v.as_array().map(|a| a.len()))
+                        .unwrap_or(0),
+                    Err(_) => 0,
+                },
+                Err(_) => 0,
+            };
+
+            eprintln!("   Waiting for layerd to resolve...");
+
+            for poll_attempt in 0..120 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Ok(resp) = reqwest::get(dashboard_url).await {
+                    if let Ok(body) = resp.text().await {
+                        if let Ok(history) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(arr) = history.as_array() {
+                                if arr.len() > baseline_count {
+                                    if let Some(entry) = arr.last() {
+                                        let rid = entry.get("request_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        let output = entry.get("output").and_then(|v| v.as_str()).unwrap_or("?");
+                                        let instructions = entry.get("instructions").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        let time_ms = entry.get("execution_time_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        let success = entry.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                                        let resolve_tx = entry.get("resolve_tx_hash").and_then(|v| v.as_str()).unwrap_or("?");
+                                        eprintln!();
+                                        eprintln!("📋 Result for request #{}:", rid);
+                                        eprintln!("   Output: {}", output);
+                                        eprintln!("   Instructions: {}", instructions);
+                                        eprintln!("   Time: {}ms", time_ms);
+                                        eprintln!("   Success: {}", success);
+                                        eprintln!("   Resolve TX: {}", resolve_tx);
+                                        std::process::exit(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if poll_attempt % 20 == 19 {
+                    eprintln!("   ... still waiting ({}s)", (poll_attempt + 1) / 2);
+                }
+            }
+            eprintln!("   ⚠ Timed out waiting for result. Check daemon dashboard.");
+            std::process::exit(1);
+        });
+    }
+
+    anyhow::bail!("All RPC endpoints failed: {}", last_err);
 }
 
 /// Find signer key from ~/.near-credentials
@@ -433,7 +536,7 @@ fn cmd_status(extra_args: &[String]) -> Result<()> {
     let network = network.unwrap_or_else(|| "testnet".to_string());
 
     let rpc_url = match network.as_str() {
-        "mainnet" => "https://rpc.mainnet.near.org".to_string(),
+        "mainnet" => "https://rpc.fastnear.com".to_string(),
         "testnet" => "https://test.rpc.fastnear.com".to_string(),
         other => format!("https://rpc.{}.near.org", other),
     };
@@ -845,7 +948,7 @@ fn cmd_register(extra_args: &[String], config_dir: &Path) -> Result<()> {
     // Build create_project transaction
     eprintln!("   📝 Calling create_project on contract...");
     let rpc_url = match network.as_str() {
-        "mainnet" => "https://rpc.mainnet.near.org",
+        "mainnet" => "https://rpc.fastnear.com",
         "testnet" => "https://test.rpc.fastnear.com",
         _ => return Err(anyhow::anyhow!("Unknown network: {}", network)),
     };
@@ -1194,7 +1297,7 @@ fn handle_payment_challenge(
     let rpc_url = if account.ends_with(".testnet") || account.contains(".testnet.") {
         "https://rpc.testnet.near.org"
     } else {
-        "https://rpc.mainnet.near.org"
+        "https://rpc.fastnear.com"
     };
 
     let token = challenge.token.as_deref().unwrap_or("NEAR");
@@ -1543,7 +1646,7 @@ fn cmd_projects(extra_args: &[String], config_dir: &Path) -> Result<()> {
     eprintln!("📋 Listing projects for: {}", account_id);
 
     let rpc_url = match network.as_str() {
-        "mainnet" => "https://rpc.mainnet.near.org",
+        "mainnet" => "https://rpc.fastnear.com",
         "testnet" => "https://test.rpc.fastnear.com",
         _ => return Err(anyhow::anyhow!("Unknown network: {}", network)),
     };

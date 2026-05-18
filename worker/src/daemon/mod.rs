@@ -37,6 +37,7 @@ pub mod escrow_commands;
 mod manage;
 mod nonce;
 mod payment;
+pub mod radicle_client;
 mod rpc_pool;
 mod tunnel;
 mod watcher;
@@ -364,50 +365,10 @@ pub(crate) fn resolve_wasm(source: &ParsedSource, config: &DaemonConfig) -> Opti
 }
 
 /// Find WASM locally by URL filename, then fall back to download.
-fn resolve_wasm_from_url(url: &str, _hash: &str) -> Option<Vec<u8>> {
+fn resolve_wasm_from_url(url: &str, expected_hash: &str) -> Option<Vec<u8>> {
     // Extract filename from URL (e.g. "nostr-identity-zkp-tee-wasip2.wasm")
     let filename = url.rsplit('/').next().unwrap_or("");
 
-    // Search local paths first
-    if !filename.is_empty() {
-        let home = dirs::home_dir().unwrap_or_default();
-        let search_dirs = vec![
-            home.join(".openclaw/workspace"),
-            home.join(".openclaw/workspace/nostr-identity"),
-            PathBuf::from("."),
-        ];
-        for dir in &search_dirs {
-            let candidate = dir.join(filename);
-            if candidate.exists() {
-                tracing::info!("   📦 Local WASM: {}", candidate.display());
-                return fs::read(&candidate).ok();
-            }
-            // Also check for wasip2 variant
-            if !filename.contains("wasip2") {
-                let p2_name = filename.replace(".wasm", "-wasip2.wasm");
-                let candidate2 = dir.join(&p2_name);
-                if candidate2.exists() {
-                    tracing::info!("   📦 Local WASM: {}", candidate2.display());
-                    return fs::read(&candidate2).ok();
-                }
-            }
-        }
-
-        // Broader search: find any file matching the filename in search paths
-        let workspace = home.join(".openclaw/workspace");
-        if let Ok(entries) = walk_wasm_files(&workspace) {
-            for path in entries {
-                let fname = path.file_name().unwrap_or_default().to_string_lossy();
-                if fname == filename || (filename.contains("wasip2") && fname.contains("wasip2") && fname.contains(&filename.replace("-wasip2.wasm", "").replace(".wasm", ""))) {
-                    tracing::info!("   📦 Local WASM: {}", path.display());
-                    return fs::read(&path).ok();
-                }
-            }
-        }
-    }
-
-    // Fallback: download (only if no local match)
-    tracing::info!("   ⬇️ Not found locally, downloading: {}", url);
     let cache_dir = dirs::home_dir().unwrap_or_default().join(".inlayer").join("wasm_cache");
     fs::create_dir_all(&cache_dir).ok();
     let cache_key = {
@@ -416,9 +377,91 @@ fn resolve_wasm_from_url(url: &str, _hash: &str) -> Option<Vec<u8>> {
         format!("{:x}", hasher.finalize())
     };
     let cached_path = cache_dir.join(format!("{}.wasm", cache_key));
+
+    // If we have a cached file and an expected hash, verify it matches
     if cached_path.exists() {
-        return fs::read(&cached_path).ok();
+        if let Ok(bytes) = fs::read(&cached_path) {
+            if !expected_hash.is_empty() {
+                let actual_hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+                if actual_hash == expected_hash {
+                    tracing::info!("   📦 Cached WASM (hash verified): {}", filename);
+                    return Some(bytes);
+                }
+                tracing::info!("   🔄 Cached WASM hash mismatch, re-downloading");
+            } else {
+                // No hash to verify — use cache as-is
+                tracing::info!("   📦 Cached WASM: {}", filename);
+                return Some(bytes);
+            }
+        }
     }
+
+    // Search local paths (only if no hash verification needed or cache miss)
+    if !expected_hash.is_empty() {
+        // When hash is provided, search local paths but verify hash
+        if !filename.is_empty() {
+            let home = dirs::home_dir().unwrap_or_default();
+            let search_dirs = vec![
+                home.join(".openclaw/workspace"),
+                home.join(".openclaw/workspace/nostr-identity"),
+                PathBuf::from("."),
+            ];
+            for dir in &search_dirs {
+                let candidate = dir.join(filename);
+                if candidate.exists() {
+                    if let Ok(bytes) = fs::read(&candidate) {
+                        let actual_hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+                        if actual_hash == expected_hash {
+                            tracing::info!("   📦 Local WASM (hash verified): {}", candidate.display());
+                            let _ = fs::write(&cached_path, &bytes);
+                            return Some(bytes);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // No hash — fall back to local search (backward compatible)
+        if !filename.is_empty() {
+            let home = dirs::home_dir().unwrap_or_default();
+            let search_dirs = vec![
+                home.join(".openclaw/workspace"),
+                home.join(".openclaw/workspace/nostr-identity"),
+                PathBuf::from("."),
+            ];
+            for dir in &search_dirs {
+                let candidate = dir.join(filename);
+                if candidate.exists() {
+                    tracing::info!("   📦 Local WASM: {}", candidate.display());
+                    return fs::read(&candidate).ok();
+                }
+                // Also check for wasip2 variant
+                if !filename.contains("wasip2") {
+                    let p2_name = filename.replace(".wasm", "-wasip2.wasm");
+                    let candidate2 = dir.join(&p2_name);
+                    if candidate2.exists() {
+                        tracing::info!("   📦 Local WASM: {}", candidate2.display());
+                        return fs::read(&candidate2).ok();
+                    }
+                }
+            }
+
+            // Broader search: find any file matching the filename in search paths
+            let workspace = home.join(".openclaw/workspace");
+            if let Ok(entries) = walk_wasm_files(&workspace) {
+                for path in entries {
+                    let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                    if fname == filename || (filename.contains("wasip2") && fname.contains("wasip2") && fname.contains(&filename.replace("-wasip2.wasm", "").replace(".wasm", ""))) {
+                        tracing::info!("   📦 Local WASM: {}", path.display());
+                        return fs::read(&path).ok();
+                    }
+                }
+            }
+        }
+    }
+
+    // Download from URL
+    tracing::info!("   ⬇️ Downloading: {}", url);
     let response = reqwest::blocking::ClientBuilder::new()
         .timeout(std::time::Duration::from_secs(60))
         .build().ok()?
@@ -427,6 +470,16 @@ fn resolve_wasm_from_url(url: &str, _hash: &str) -> Option<Vec<u8>> {
         .ok()?;
     if !response.status().is_success() { return None; }
     let bytes = response.bytes().ok()?.to_vec();
+
+    // Verify hash if provided
+    if !expected_hash.is_empty() {
+        let actual_hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+        if actual_hash != expected_hash {
+            tracing::warn!("   ⚠️ Downloaded WASM hash mismatch! expected={} got={}", expected_hash, actual_hash);
+            return None;
+        }
+    }
+
     fs::write(&cached_path, &bytes).ok();
     Some(bytes)
 }
@@ -1540,7 +1593,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
     let mut consecutive_errors = 0u32;
     let last_rpc_poll = std::time::Instant::now();
-    let min_rpc_interval = Duration::from_secs(daemon_cfg.poll_interval_secs.max(5));
+    let min_rpc_interval = Duration::from_secs(daemon_cfg.poll_interval_secs.max(2));
 
     loop {
         // ── Process Nostr events (non-blocking) ───────────────────────
@@ -1722,7 +1775,14 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                             }
                         }
                     }
-                    if tx_result.is_ok() { processed.insert(req_id); }
+                    // Mark as processed on success OR if already resolved (contract removed it)
+                    let already_resolved = tx_result.as_ref().is_err_and(|e| e.to_string().contains("not found"));
+                    if tx_result.is_ok() || already_resolved {
+                        if already_resolved {
+                            log(&format!("   #{} already resolved on-chain, skipping", req_id));
+                        }
+                        processed.insert(req_id);
+                    }
                 }
 
                 if processed.len() > 500 {
