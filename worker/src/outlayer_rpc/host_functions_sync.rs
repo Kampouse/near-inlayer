@@ -31,6 +31,51 @@ wasmtime::component::bindgen!({
     world: "rpc-host",
 });
 
+/// SSRF protection: block internal/private IPs
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // Loopback: 127.0.0.0/8
+            if octets[0] == 127 {
+                return true;
+            }
+            // Private: 10.0.0.0/8
+            if octets[0] == 10 {
+                return true;
+            }
+            // Private: 172.16.0.0/12
+            if octets[0] == 172 && (octets[1] & 0xf0) == 16 {
+                return true;
+            }
+            // Private: 192.168.0.0/16
+            if octets[0] == 192 && octets[1] == 168 {
+                return true;
+            }
+            // Link-local: 169.254.0.0/16
+            if octets[0] == 169 && octets[1] == 254 {
+                return true;
+            }
+            // Broadcast: 255.255.255.255
+            if octets == [255, 255, 255, 255] {
+                return true;
+            }
+            false
+        }
+        std::net::IpAddr::V6(v6) => {
+            // Loopback: ::1
+            if v6.is_loopback() {
+                return true;
+            }
+            // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) — recurse on the inner v4
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(std::net::IpAddr::V4(v4));
+            }
+            false
+        }
+    }
+}
+
 /// RPC Proxy client with rate limiting (uses async-compatible blocking HTTP)
 pub struct RpcProxy {
     /// HTTP client for RPC requests (blocking)
@@ -103,6 +148,115 @@ impl RpcProxy {
         } else {
             url.to_string()
         }
+    }
+
+    /// SSRF protection: validate URL and resolve DNS to block internal IPs
+    fn validate_url(&self, url: &str) -> Result<()> {
+        let parsed = reqwest::Url::parse(url)
+            .with_context(|| format!("Invalid URL: {}", url))?;
+
+        match parsed.scheme() {
+            "https" | "http" => {}
+            scheme => anyhow::bail!(
+                "Unsupported URL scheme: {}. Only http and https allowed.",
+                scheme
+            ),
+        }
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("URL has no host: {}", url))?;
+
+        let port = parsed.port().unwrap_or(match parsed.scheme() {
+            "https" => 443,
+            _ => 80,
+        });
+
+        let addrs: Vec<std::net::SocketAddr> =
+            std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+                .with_context(|| format!("DNS resolution failed for {}:{}", host, port))?
+                .collect();
+
+        if addrs.is_empty() {
+            anyhow::bail!("DNS resolution returned no addresses for {}:{}", host, port);
+        }
+
+        for addr in &addrs {
+            if is_blocked_ip(addr.ip()) {
+                anyhow::bail!(
+                    "URL {} resolves to blocked IP {}. SSRF protection triggered.",
+                    host,
+                    addr.ip()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse optional JSON headers string into a vec of (name, value) pairs
+    fn parse_headers_json(headers_json: Option<&str>) -> Vec<(String, String)> {
+        if let Some(json_str) = headers_json {
+            if json_str.trim().is_empty() {
+                return Vec::new();
+            }
+            if let Ok(map) = serde_json::from_str::<serde_json::Map<String, Value>>(json_str) {
+                let mut headers = Vec::new();
+                for (k, v) in map {
+                    if let Some(s) = v.as_str() {
+                        headers.push((k, s.to_string()));
+                    }
+                }
+                return headers;
+            }
+        }
+        Vec::new()
+    }
+
+    /// HTTP GET request (blocking, with SSRF protection)
+    pub fn http_get(&self, url: &str, headers_json: Option<&str>) -> Result<String> {
+        self.check_rate_limit()?;
+        self.validate_url(url)?;
+
+        let headers = Self::parse_headers_json(headers_json);
+        info!("[RPC] HTTP GET {}", Self::safe_url_display(url));
+
+        let mut req = self.client.get(url);
+        for (name, value) in headers {
+            req = req.header(&name, &value);
+        }
+
+        let resp = req.send().with_context(|| format!("HTTP GET failed for {}", url))?;
+        let body: Value = resp.json().context("Failed to parse HTTP GET response as JSON")?;
+        let result = serde_json::to_string(&body)?;
+        Ok(result)
+    }
+
+    /// HTTP POST request with body and optional headers (blocking, with SSRF protection)
+    pub fn http_post(&self, url: &str, body: &str, headers_json: Option<&str>) -> Result<String> {
+        self.check_rate_limit()?;
+        self.validate_url(url)?;
+
+        let headers = Self::parse_headers_json(headers_json);
+        info!(
+            "[RPC] HTTP POST {} ({} bytes)",
+            Self::safe_url_display(url),
+            body.len()
+        );
+
+        let mut req = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string());
+        for (name, value) in headers {
+            req = req.header(&name, &value);
+        }
+
+        let resp = req.send().with_context(|| format!("HTTP POST failed for {}", url))?;
+        let resp_body: Value = resp.json().context("Failed to parse HTTP POST response as JSON")?;
+        let result = serde_json::to_string(&resp_body)?;
+        Ok(result)
     }
 
     /// Send JSON-RPC request (blocking)
@@ -764,6 +918,27 @@ impl near::rpc::api::Host for RpcHostState {
 
         match self.proxy.call_method(&method, params) {
             Ok(result) => (serde_json::to_string(&result).unwrap_or_default(), String::new()),
+            Err(e) => (String::new(), e.to_string()),
+        }
+    }
+
+    // ==================== HTTP API ====================
+
+    fn http_get(&mut self, url: String, headers: Option<String>) -> (String, String) {
+        match self.proxy.http_get(&url, headers.as_deref()) {
+            Ok(result) => (result, String::new()),
+            Err(e) => (String::new(), e.to_string()),
+        }
+    }
+
+    fn http_post(
+        &mut self,
+        url: String,
+        body: String,
+        headers: Option<String>,
+    ) -> (String, String) {
+        match self.proxy.http_post(&url, &body, headers.as_deref()) {
+            Ok(result) => (result, String::new()),
             Err(e) => (String::new(), e.to_string()),
         }
     }
