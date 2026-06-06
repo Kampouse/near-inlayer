@@ -1,0 +1,19 @@
+[package]
+name = "http-test"
+version = "0.1.0"
+edition = "2021"
+description = "Test WASM for near:rpc/api http-get and http-post host functions"
+
+[[bin]]
+name = "http-test"
+path = "src/main.rs"
+
+[dependencies]
+wit-bindgen = "0.36"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

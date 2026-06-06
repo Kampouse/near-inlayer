@@ -1,0 +1,18 @@
+package near:rpc@0.1.0;
+
+interface api {
+    // ==================== HTTP Methods ====================
+
+    /// HTTP GET request (blocking, with SSRF protection)
+    /// Returns (body, error) - error is empty string on success
+    /// headers: optional JSON object of extra headers
+    http-get: func(url: string, headers: option<string>) -> tuple<string, string>;
+
+    /// HTTP POST request with body and optional headers (blocking, with SSRF protection)
+    /// Returns (body, error) - error is empty string on success
+    http-post: func(url: string, body: string, headers: option<string>) -> tuple<string, string>;
+}
+
+world http-test {
+    import api;
+}
