@@ -106,6 +106,18 @@ interface api {
     /// Content-Type defaults to application/json; override via headers if needed
     /// headers: optional JSON object of extra headers, e.g. {"Authorization": "Bearer ..."}
     http-post: func(url: string, body: string, headers: option<string>) -> tuple<string, string>;
+
+    // ==================== Utility Methods ====================
+
+    /// Read an environment variable value
+    /// Returns the value string, or empty string if not found
+    env-var: func(name: string) -> string;
+
+    /// Sign a message with ed25519 private key
+    /// secret-key: NEAR format "ed25519:base58..." or hex-encoded 32 bytes
+    /// message: arbitrary string to sign
+    /// Returns base64-encoded 64-byte signature, or empty string on error
+    ed25519-sign: func(secret-key: string, message: string) -> string;
 }
 
 world rpc-host {

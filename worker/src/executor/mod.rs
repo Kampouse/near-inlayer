@@ -212,6 +212,12 @@ impl Executor {
                     execution_time_ms, instructions
                 );
                 info!("📦 Raw output size: {} bytes", output_bytes.len());
+                // Debug: dump first non-ASCII byte if any
+                if let Some(pos) = output_bytes.iter().position(|&b| b > 127) {
+                    let ctx_start = pos.saturating_sub(10);
+                    let ctx = &output_bytes[ctx_start..(pos + 10).min(output_bytes.len())];
+                    info!("⚠️ First non-ASCII at byte {}: 0x{:02x}, context: {:?}", pos, output_bytes[pos], ctx);
+                }
                 if let Some(refund) = refund_usd {
                     info!("💰 WASM requested refund of {} USD", refund);
                 }
@@ -226,8 +232,7 @@ impl Executor {
                         Some(ExecutionOutput::Bytes(output_bytes))
                     }
                     ResponseFormat::Text => {
-                        let text = String::from_utf8(output_bytes)
-                            .unwrap_or_else(|e| format!("Invalid UTF-8 output: {}", e));
+                        let text = String::from_utf8_lossy(&output_bytes).to_string();
                         Some(ExecutionOutput::Text(text))
                     }
                     ResponseFormat::Json => {

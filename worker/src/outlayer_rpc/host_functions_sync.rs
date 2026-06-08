@@ -942,6 +942,38 @@ impl near::rpc::api::Host for RpcHostState {
             Err(e) => (String::new(), e.to_string()),
         }
     }
+
+    // ==================== Utility Methods ====================
+
+    fn env_var(&mut self, name: String) -> String {
+        std::env::var(&name).unwrap_or_default()
+    }
+
+    fn ed25519_sign(&mut self, secret_key: String, message: String) -> String {
+        use base64::Engine;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let sk_bytes: [u8; 32] = if let Some(stripped) = secret_key.strip_prefix("ed25519:") {
+            match bs58::decode(stripped).into_vec() {
+                Ok(bytes) if bytes.len() == 32 => match bytes.try_into() {
+                    Ok(arr) => arr,
+                    Err(_) => return String::new(),
+                },
+                _ => return String::new(),
+            }
+        } else if let Ok(bytes) = hex::decode(&secret_key) {
+            match bytes.try_into() {
+                Ok(arr) => arr,
+                Err(_) => return String::new(),
+            }
+        } else {
+            return String::new();
+        };
+
+        let signing_key = SigningKey::from_bytes(&sk_bytes);
+        let signature = signing_key.sign(message.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    }
 }
 
 /// Add NEAR RPC host functions to a wasmtime component linker

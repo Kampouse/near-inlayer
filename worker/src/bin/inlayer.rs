@@ -146,10 +146,11 @@ fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option
     let cfg = Config::load(config_dir);
     let wasm_path = find_wasm(wasm_name, config_dir, &cfg)?;
 
+    // Try to init tracing, ignore if already initialized (e.g., by main())
     let filter = EnvFilter::try_new(format!(
         "inlayer={},offchainvm_worker={}", cfg.runner.log_level, cfg.runner.log_level
     )).unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let rpc_url = rpc_override.map(|s| s.to_string()).unwrap_or(cfg.rpc.url.clone());
     let storage_dir = PathBuf::from(&cfg.storage.dir);
