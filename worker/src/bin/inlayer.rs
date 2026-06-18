@@ -8,7 +8,7 @@ use offchainvm_worker::outlayer_storage::client::StorageConfig;
 
 use std::collections::HashMap;
 use std::env;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -141,6 +141,174 @@ fn find_wasm(name: &str, config_dir: &Path, cfg: &Config) -> Result<PathBuf> {
     }
     anyhow::bail!("WASM not found: {}\n  Run `inlayer list` to see available WASMs", name)
 }
+
+/// Telegram bot: long-polls getUpdates, runs WASM with message as input, replies with output.
+/// Usage: inlayer bot [--wasm <program>] [--chat <id>]
+/// Config: needs TELEGRAM_BOT_TOKEN in [env], and a default WASM in config or via --wasm
+fn cmd_bot(config_dir: &Path) -> Result<()> {
+    eprintln!("[bot] loading config...");
+    let _ = std::io::stderr().flush();
+    let cfg = Config::load(config_dir);
+    // Set env vars from config BEFORE reading TELEGRAM_BOT_TOKEN
+    for (k, v) in &cfg.env { env::set_var(k, v); }
+
+    // Get bot token from env
+    let token = env::var("TELEGRAM_BOT_TOKEN")
+        .map_err(|_| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not set in [env] section of config"))?;
+
+    // We need a WASM to run — look for bot.wasm or use BOT_WASM env var
+    let wasm_name = env::var("BOT_WASM").unwrap_or_else(|_| "bot".to_string());
+    let wasm_path = find_wasm(&wasm_name, config_dir, &cfg)
+        .map_err(|_| anyhow::anyhow!("WASM '{}' not found. Set BOT_WASM in [env] or put bot.wasm in search paths", wasm_name))?;
+    let wasm_bytes = std::fs::read(&wasm_path)
+        .with_context(|| format!("reading {}", wasm_path.display()))?;
+
+    // Set up RPC + storage + env vars like cmd_run
+    let rpc_url = cfg.rpc.url.clone();
+    let storage_dir = PathBuf::from(&cfg.storage.dir);
+    std::fs::create_dir_all(&storage_dir).ok();
+    for (k, v) in &cfg.env { env::set_var(k, v); }
+    env::set_var("STORAGE_DIR", &storage_dir);
+
+    let env_vars: HashMap<String, String> = cfg.env.clone();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let handle = rt.handle().clone();
+
+    // Bot mode: no RPC needed, just run pure WASM
+    let exec_ctx = ExecutionContext {
+        outlayer_rpc: None,
+        storage_config: None,
+        runtime_handle: handle,
+        compiled_cache: None,
+        vrf_config: None,
+        wallet_config: None,
+    };
+
+    let executor = Executor::new(cfg.runner.max_instructions, true).with_context(exec_ctx);
+
+    let limits = ResourceLimits {
+        max_instructions: cfg.runner.max_instructions,
+        max_memory_mb: cfg.runner.max_memory_mb,
+        max_execution_seconds: cfg.runner.max_execution_seconds,
+    };
+
+    eprintln!("🤖 Telegram bot started");
+    eprintln!("   WASM: {}", wasm_path.display());
+    eprintln!("   Polling for messages...\n");
+    let _ = std::io::stderr().flush();
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+    let mut offset: i64 = 0;
+
+    loop {
+        // getUpdates with long-polling (timeout=30s)
+        let url = format!(
+            "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout=30&allowed_updates=[\"message\"]",
+            token, offset
+        );
+
+        let resp = match client.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[bot] getUpdates error: {}, retrying in 5s...", e);
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
+        };
+
+        let body: serde_json::Value = match resp.json() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[bot] parse error: {}, retrying...", e);
+                continue;
+            }
+        };
+
+        if body["ok"].as_bool() != Some(true) {
+            eprintln!("[bot] API error: {:?}", body["description"]);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            continue;
+        }
+
+        let updates = body["result"].as_array().cloned().unwrap_or_default();
+
+        for update in &updates {
+            let update_id = update["update_id"].as_i64().unwrap_or(0);
+            if update_id >= offset {
+                offset = update_id + 1;
+            }
+
+            // Extract message
+            let msg = &update["message"];
+            let chat_id = msg["chat"]["id"].as_i64().unwrap_or(0);
+            let text = msg["text"].as_str().unwrap_or("");
+            let from = msg["from"]["first_name"].as_str().unwrap_or("unknown");
+
+            if chat_id == 0 || text.is_empty() {
+                continue;
+            }
+
+            eprintln!("[bot] @{}: {}", from, text);
+
+            // Build input JSON with chat context
+            let input_json = serde_json::json!({
+                "chat_id": chat_id,
+                "from": from,
+                "text": text,
+                "message": msg
+            }).to_string();
+
+            // Run WASM
+            let result = rt.block_on(executor.execute(
+                &wasm_bytes,
+                None,
+                input_json.as_bytes(),
+                &limits,
+                if env_vars.is_empty() { None } else { Some(env_vars.clone()) },
+                Some("wasm32-wasip2"),
+                &ResponseFormat::Text,
+                None,
+                None,
+                None,
+            ))?;
+
+            let reply = match result.output {
+                Some(ExecutionOutput::Text(t)) => t,
+                Some(ExecutionOutput::Json(j)) => j.to_string(),
+                Some(ExecutionOutput::Bytes(b)) => String::from_utf8_lossy(&b).to_string(),
+                None => "WASM returned no output".to_string(),
+            };
+
+            // Send reply via Telegram API (direct HTTP, no WASM host fn needed)
+            let reply_url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+            let reply_body = serde_json::json!({
+                "chat_id": chat_id,
+                "text": reply,
+            });
+
+            match client.post(&reply_url).json(&reply_body).send() {
+                Ok(r) if r.status().is_success() => {
+                    eprintln!("[bot] replied to {} ({} bytes)", from, reply.len());
+                }
+                Ok(r) => {
+                    eprintln!("[bot] reply failed: {}", r.status());
+                }
+                Err(e) => {
+                    eprintln!("[bot] reply error: {}", e);
+                }
+            }
+        }
+
+        // Small sleep if no updates
+        if updates.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+}
+
 
 fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option<&str>) -> Result<()> {
     let cfg = Config::load(config_dir);
@@ -1855,6 +2023,9 @@ Environment Variables:\n\
         }
         "verifier" => {
             offchainvm_worker::daemon::escrow_commands::cmd_verifier(&args[2..], &config_dir)?;
+        }
+        "bot" => {
+            cmd_bot(&config_dir)?;
         }
 
         cmd => { eprintln!("Unknown: {}. Run: inlayer help", cmd); std::process::exit(1); }
