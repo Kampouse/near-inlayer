@@ -72,8 +72,7 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const HTTP_TIMEOUT_ABORT_THRESHOLD: u32 = 2;
 
 /// Host state for WASI P2 execution
-///
-/// Contains WASI context, HTTP context, and optionally RPC proxy, storage, payment, VRF, and wallet state.
+///\n/// Contains WASI context, HTTP context, and optionally RPC proxy, storage, payment, VRF, and wallet state.
 struct HostState {
     wasi_ctx: WasiCtx,
     wasi_http_ctx: WasiHttpCtx,
@@ -82,9 +81,8 @@ struct HostState {
     rpc_state: Option<RpcHostState>,
     /// Storage state (only present if ExecutionContext has storage_config)
     storage_state: Option<StorageHostState>,
-    /// Payment state (only present if attached_usd > 0)
-    /// VRF state (only present if keystore configured + request_id available)
-    /// Wallet state (only present if wallet_id in execution request)
+    /// Outlayer flat host state (for lisp-rlm P2 components using outlayer:api/host)
+    outlayer_state: Option<crate::outlayer_flat::OutlayerHostState>,
     /// Counter for timed-out HTTP requests (shared with spawned tasks)
     http_timeout_count: Arc<std::sync::atomic::AtomicU32>,
     /// Engine handle to force epoch interrupt when aborting due to HTTP abuse (Engine::clone is Arc)
@@ -331,6 +329,14 @@ pub async fn execute(
         None
     };
 
+    // Register outlayer:api/host for lisp-rlm P2 components (send-telegram, http-post, etc.)
+    {
+        crate::outlayer_flat::add_outlayer_to_linker(&mut linker, |state: &mut HostState| {
+            state.outlayer_state.as_mut().expect("outlayer state")
+        })?;
+        debug!("Added outlayer:api/host to linker");
+    }
+
     // Extract attached_usd from env_vars for payment state
     // Must be done before env_vars is consumed by wasi_builder
     let _attached_usd: u64 = env_vars
@@ -384,6 +390,7 @@ pub async fn execute(
         table: ResourceTable::new(),
         rpc_state,
         storage_state,
+        outlayer_state: Some(crate::outlayer_flat::OutlayerHostState::new()),
         http_timeout_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         engine_handle: engine,
     };
