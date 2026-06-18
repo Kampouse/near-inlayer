@@ -254,16 +254,14 @@ fn cmd_bot(config_dir: &Path) -> Result<()> {
 
             eprintln!("[bot] @{}: {}", from, text);
 
-            let reply = if wasm_bytes.is_empty() {
-                format!("No WASM handler. Msg: {}", text)
-            } else {
+            if !wasm_bytes.is_empty() {
                 let input_json = serde_json::json!({
                     "chat_id": chat_id,
                     "from": from,
                     "text": text,
                 }).to_string();
 
-                let result = rt.block_on(executor.execute(
+                match rt.block_on(executor.execute(
                     &wasm_bytes,
                     None,
                     input_json.as_bytes(),
@@ -274,47 +272,12 @@ fn cmd_bot(config_dir: &Path) -> Result<()> {
                     None,
                     None,
                     None,
-                ))?;
-
-                let raw = match result.output {
-                    Some(ExecutionOutput::Text(t)) => t,
-                    Some(ExecutionOutput::Json(j)) => j.to_string(),
-                    Some(ExecutionOutput::Bytes(b)) => String::from_utf8_lossy(&b).to_string(),
-                    None => "WASM returned no output".to_string(),
-                };
-
-                // If output looks like a ZAI chat completion, extract content
-                if raw.contains("\"choices\"") {
-                    if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        resp["choices"][0]["message"]["content"]
-                            .as_str()
-                            .unwrap_or(&raw)
-                            .to_string()
-                    } else {
-                        raw
-                    }
-                } else {
-                    raw
+                )) {
+                    Ok(_) => eprintln!("[bot] WASM executed (reply sent by send-telegram host)"),
+                    Err(e) => eprintln!("[bot] WASM error: {}", e),
                 }
-            };
-
-            // Send reply via Telegram API (direct HTTP, no WASM host fn needed)
-            let reply_url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-            let reply_body = serde_json::json!({
-                "chat_id": chat_id,
-                "text": reply,
-            });
-
-            match client.post(&reply_url).json(&reply_body).send() {
-                Ok(r) if r.status().is_success() => {
-                    eprintln!("[bot] replied to {} ({} bytes)", from, reply.len());
-                }
-                Ok(r) => {
-                    eprintln!("[bot] reply failed: {}", r.status());
-                }
-                Err(e) => {
-                    eprintln!("[bot] reply error: {}", e);
-                }
+            } else {
+                eprintln!("[bot] no WASM handler loaded");
             }
         }
 
