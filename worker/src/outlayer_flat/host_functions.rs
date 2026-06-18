@@ -343,6 +343,117 @@ impl outlayer::api::host::Host for OutlayerHostState {
             .map_err(|e| { eprintln!("[send-telegram] THREAD PANIC: {:?}", e); "thread panicked".to_string() })?
         })
     }
+
+    fn web_search(&mut self, query: String) -> Result<String, String> {
+        eprintln!("[web-search] query={}", query);
+        let api_key = std::env::var("AI_API_KEY")
+            .map_err(|_| "AI_API_KEY not set".to_string())?;
+        let auth_val = format!("Bearer {}", api_key);
+        let mcp_url = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        // Step 1: Initialize MCP session
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "outlayer", "version": "1.0"}
+            }
+        });
+        let init_resp = client.post(mcp_url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Authorization", &auth_val)
+            .json(&init_body)
+            .send()
+            .map_err(|e| format!("MCP init failed: {}", e))?;
+        let session_id = init_resp.headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        // Step 2: Send initialized notification
+        let _ = client.post(mcp_url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", &auth_val)
+            .header("Mcp-Session-Id", &session_id)
+            .json(&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send();
+
+        // Step 3: Call web_search_prime
+        let search_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "web_search_prime",
+                "arguments": {"search_query": &query}
+            }
+        });
+        let search_resp = client.post(mcp_url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Authorization", &auth_val)
+            .header("Mcp-Session-Id", &session_id)
+            .json(&search_body)
+            .send()
+            .map_err(|e| format!("MCP search failed: {}", e))?;
+
+        if !search_resp.status().is_success() {
+            return Err(format!("MCP search HTTP {}", search_resp.status()));
+        }
+
+        // Step 4: Parse SSE response
+        let body = search_resp.text().map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        for line in body.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(content) = obj.pointer("/result/content") {
+                        if let Some(arr) = content.as_array() {
+                            for item in arr {
+                                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                    // MCP triple-encodes JSON: parse up to 3 times until we get an array
+                                    let mut parsed: serde_json::Value =
+                                        serde_json::Value::String(text.to_string());
+                                    for _ in 0..3 {
+                                        if parsed.is_string() {
+                                            if let Ok(inner) =
+                                                serde_json::from_str::<serde_json::Value>(
+                                                    parsed.as_str().unwrap(),
+                                                )
+                                            {
+                                                parsed = inner;
+                                            } else {
+                                                break;
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    if let Some(items) = parsed.as_array() {
+                                        for r in items {
+                                            results.push(serde_json::json!({
+                                                "title": r.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                                                "content": r.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                                                "url": r.get("link").or_else(|| r.get("url")).and_then(|v| v.as_str()).unwrap_or(""),
+                                                "siteName": r.get("siteName").and_then(|v| v.as_str()).unwrap_or("")
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string()))
+    }
 }
 
 /// Add outlayer host functions to a wasmtime component linker

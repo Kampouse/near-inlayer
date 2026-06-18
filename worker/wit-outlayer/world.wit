@@ -28,6 +28,11 @@ interface host {
     /// Send a Telegram message via bot API
     /// Reads TELEGRAM_BOT_TOKEN from environment
     send-telegram: func(chat-id: string, text: string) -> result<string, string>;
+
+    /// Web search via ZAI MCP web_search_prime
+    /// Reads AI_API_KEY from environment
+    /// Returns JSON array of search results: [{title, content, url, siteName}]
+    web-search: func(query: string) -> result<string, string>;
 }
 
 world outlayer-world {
