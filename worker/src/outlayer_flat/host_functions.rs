@@ -454,6 +454,45 @@ impl outlayer::api::host::Host for OutlayerHostState {
         }
         Ok(serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string()))
     }
+
+    fn ai_chat(&mut self, prompt: String) -> Result<String, String> {
+        eprintln!("[ai-chat] prompt={}", &prompt[..prompt.len().min(100)]);
+        let api_key = std::env::var("AI_API_KEY").map_err(|_| "AI_API_KEY not set".to_string())?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| format!("client build: {}", e))?;
+        let body = serde_json::json!({
+            "model": "glm-5-turbo",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant inside a NEAR blockchain agent. Be concise. Respond in plain text."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 2000
+        });
+        let resp = client
+            .post("https://api.z.ai/api/coding/paas/v4/chat/completions")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&body)
+            .send()
+            .map_err(|e| format!("ai-chat request failed: {}", e))?;
+        let status = resp.status();
+        let resp_body: serde_json::Value = resp.json().map_err(|e| format!("ai-chat parse: {}", e))?;
+        if !status.is_success() {
+            let err = resp_body.pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("ai-chat HTTP {}: {}", status, err));
+        }
+        let content = resp_body
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        eprintln!("[ai-chat] response len={}", content.len());
+        Ok(content)
+    }
 }
 
 /// Add outlayer host functions to a wasmtime component linker
