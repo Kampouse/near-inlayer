@@ -142,6 +142,7 @@ fn find_wasm(name: &str, config_dir: &Path, cfg: &Config) -> Result<PathBuf> {
     anyhow::bail!("WASM not found: {}\n  Run `inlayer list` to see available WASMs", name)
 }
 
+/// Call ZAI glm-5-turbo with user message, return AI reply text.
 /// Telegram bot: long-polls getUpdates, runs WASM with message as input, replies with output.
 /// Usage: inlayer bot [--wasm <program>] [--chat <id>]
 /// Config: needs TELEGRAM_BOT_TOKEN in [env], and a default WASM in config or via --wasm
@@ -253,33 +254,48 @@ fn cmd_bot(config_dir: &Path) -> Result<()> {
 
             eprintln!("[bot] @{}: {}", from, text);
 
-            // Build input JSON with chat context
-            let input_json = serde_json::json!({
-                "chat_id": chat_id,
-                "from": from,
-                "text": text,
-                "message": msg
-            }).to_string();
+            let reply = if wasm_bytes.is_empty() {
+                format!("No WASM handler. Msg: {}", text)
+            } else {
+                let input_json = serde_json::json!({
+                    "chat_id": chat_id,
+                    "from": from,
+                    "text": text,
+                }).to_string();
 
-            // Run WASM
-            let result = rt.block_on(executor.execute(
-                &wasm_bytes,
-                None,
-                input_json.as_bytes(),
-                &limits,
-                if env_vars.is_empty() { None } else { Some(env_vars.clone()) },
-                Some("wasm32-wasip2"),
-                &ResponseFormat::Text,
-                None,
-                None,
-                None,
-            ))?;
+                let result = rt.block_on(executor.execute(
+                    &wasm_bytes,
+                    None,
+                    input_json.as_bytes(),
+                    &limits,
+                    if env_vars.is_empty() { None } else { Some(env_vars.clone()) },
+                    Some("wasm32-wasip2"),
+                    &ResponseFormat::Text,
+                    None,
+                    None,
+                    None,
+                ))?;
 
-            let reply = match result.output {
-                Some(ExecutionOutput::Text(t)) => t,
-                Some(ExecutionOutput::Json(j)) => j.to_string(),
-                Some(ExecutionOutput::Bytes(b)) => String::from_utf8_lossy(&b).to_string(),
-                None => "WASM returned no output".to_string(),
+                let raw = match result.output {
+                    Some(ExecutionOutput::Text(t)) => t,
+                    Some(ExecutionOutput::Json(j)) => j.to_string(),
+                    Some(ExecutionOutput::Bytes(b)) => String::from_utf8_lossy(&b).to_string(),
+                    None => "WASM returned no output".to_string(),
+                };
+
+                // If output looks like a ZAI chat completion, extract content
+                if raw.contains("\"choices\"") {
+                    if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        resp["choices"][0]["message"]["content"]
+                            .as_str()
+                            .unwrap_or(&raw)
+                            .to_string()
+                    } else {
+                        raw
+                    }
+                } else {
+                    raw
+                }
             };
 
             // Send reply via Telegram API (direct HTTP, no WASM host fn needed)
