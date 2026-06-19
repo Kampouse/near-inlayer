@@ -1,9 +1,0 @@
-This account has:
-
-- **Balance**: ~2,184,382 NEAR (2,184,381,932,653,512,200,298,981 yoctoNEAR)
-- **Contract**: None (code_hash is all 1s)
-- **Locked**: 0 NEAR
-- **Storage usage**: 182 bytes (minimal, just account state)
-- **Block height**: 203,425,542
-
-A standard funded account with no deployed contract and no locked tokens.
