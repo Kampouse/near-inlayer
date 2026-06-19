@@ -154,19 +154,66 @@ fn cmd_bot(config_dir: &Path) -> Result<()> {
 
     let token = env::var("TELEGRAM_BOT_TOKEN")
         .map_err(|_| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not set in [env] section of config"))?;
-    let ai_key = env::var("AI_API_KEY")
-        .map_err(|_| anyhow::anyhow!("AI_API_KEY not set in [env] section of config"))?;
+    let wasm_path = cfg.env.get("BOT_WASM")
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("BOT_WASM not set in [env] section of config"))?;
     let filter_chat: i64 = env::var("BOT_CHAT_FILTER")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0); // 0 = accept all chats
+        .unwrap_or(0);
+
+    // Verify WASM exists
+    let wasm_bytes = std::fs::read(&wasm_path)
+        .with_context(|| format!("reading {}", wasm_path))?;
+
+    let rpc_url = cfg.rpc.url.clone();
+    let storage_dir = PathBuf::from(&cfg.storage.dir);
+    std::fs::create_dir_all(&storage_dir).ok();
+
+    // Set up executor
+    let rpc_cfg = RpcProxyConfig {
+        enabled: true,
+        rpc_url: Some(rpc_url.clone()),
+        max_calls_per_execution: 100,
+        allow_transactions: true,
+    };
+    let proxy = RpcProxy::new(rpc_cfg, &rpc_url)?;
+    let storage_config = StorageConfig {
+        coordinator_url: "http://127.0.0.1:9999".into(),
+        coordinator_token: "local".into(),
+        keystore_url: "http://127.0.0.1:9998".into(),
+        keystore_token: "local".into(),
+        project_uuid: "local-test".into(),
+        wasm_hash: "00000000".into(),
+        account_id: cfg_env("TEE_SIGNER_ID", "test.testnet"),
+        tee_mode: "local".into(),
+        keystore_tee_session_id: None,
+    };
+
+    let env_vars: HashMap<String, String> = cfg.env.clone();
+    let rt = tokio::runtime::Runtime::new()?;
+    let handle = rt.handle().clone();
+    let exec_ctx = ExecutionContext {
+        outlayer_rpc: Some(Arc::new(proxy)),
+        storage_config: Some(storage_config),
+        runtime_handle: handle,
+        compiled_cache: None,
+        vrf_config: None,
+        wallet_config: None,
+    };
+    let executor = Executor::new(cfg.runner.max_instructions, true).with_context(exec_ctx);
+    let limits = ResourceLimits {
+        max_instructions: cfg.runner.max_instructions,
+        max_memory_mb: cfg.runner.max_memory_mb,
+        max_execution_seconds: cfg.runner.max_execution_seconds,
+    };
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
-    let mut mcp_session: Option<String> = None;
 
-    eprintln!("🤖 Telegram bot started (AI + web search)");
+    eprintln!("🤖 Telegram bot started (WASM agent)");
+    eprintln!("   WASM: {} ({} bytes)", wasm_path, wasm_bytes.len());
     eprintln!("   Chat filter: {}", if filter_chat == 0 { "all".to_string() } else { filter_chat.to_string() });
     eprintln!("   Polling for messages...\n");
     let _ = std::io::stderr().flush();
@@ -217,23 +264,27 @@ fn cmd_bot(config_dir: &Path) -> Result<()> {
             if filter_chat != 0 && chat_id != filter_chat { continue; }
 
             eprintln!("[bot] @{} ({}): {}", from, chat_id, text);
+            let _ = std::io::stderr().flush();
 
-            let reply = match handle_message(&client, &ai_key, text, &mut mcp_session) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[bot] error: {}", e);
-                    format!("Error: {}", e).to_string()
+            let input = serde_json::json!({"text": text, "chat_id": chat_id.to_string()}).to_string();
+            match rt.block_on(executor.execute(
+                &wasm_bytes,
+                None,
+                input.as_bytes(),
+                &limits,
+                if env_vars.is_empty() { None } else { Some(env_vars.clone()) },
+                Some("wasm32-wasip2"),
+                &ResponseFormat::Text,
+                None, None, None,
+            )) {
+                Ok(result) => {
+                    eprintln!("[bot] WASM done: {}ms {}instrs success={}",
+                        result.execution_time_ms, result.instructions, result.success);
                 }
-            };
-
-            let send_url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-            if let Err(e) = client.post(&send_url)
-                .json(&serde_json::json!({"chat_id": chat_id, "text": &reply}))
-                .send()
-            {
-                eprintln!("[bot] send error: {}", e);
+                Err(e) => {
+                    eprintln!("[bot] WASM error: {}", e);
+                }
             }
-            eprintln!("[bot] replied: {} chars", reply.len());
         }
 
         if updates.is_empty() {
@@ -241,237 +292,6 @@ fn cmd_bot(config_dir: &Path) -> Result<()> {
         }
     }
 }
-
-/// Handle a single user message: AI call with tool defs → tool loop → final answer
-fn handle_message(
-    client: &reqwest::blocking::Client,
-    ai_key: &str,
-    user_text: &str,
-    mcp_session: &mut Option<String>,
-) -> Result<String> {
-    let mut messages = vec![
-        serde_json::json!({"role": "system", "content": "You are a helpful AI assistant with web search capability. Give concise, accurate answers. When you need current information, use the web_search tool."}),
-        serde_json::json!({"role": "user", "content": user_text}),
-    ];
-
-    let tools = serde_json::json!([{
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for real-time information including prices, news, weather, and current events",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"}
-                },
-                "required": ["query"]
-            }
-        }
-    }]);
-
-    // Tool-calling loop (max 3 rounds)
-    for _round in 0..3 {
-        let result = call_ai(client, ai_key, &messages, Some(&tools))?;
-        let finish = result.get("choices")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.get(0))
-            .and_then(|c| c.get("finish_reason"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-
-        let ai_msg = result.get("choices")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.get(0))
-            .and_then(|c| c.get("message"))
-            .cloned()
-            .unwrap_or(serde_json::json!({"role": "assistant"}));
-
-        if finish != "tool_calls" {
-            // AI gave a final answer
-            return Ok(ai_msg.get("content").and_then(|c| c.as_str()).unwrap_or("No response").to_string());
-        }
-
-        // AI wants to call tools
-        messages.push(ai_msg.clone());
-        let tool_calls = ai_msg.get("tool_calls").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-
-        for tc in &tool_calls {
-            let fn_name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-            let fn_args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("{}");
-            let tool_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-
-            let tool_result = match fn_name {
-                "web_search" => {
-                    let args: serde_json::Value = serde_json::from_str(fn_args).unwrap_or_default();
-                    let query = args.get("query").and_then(|q| q.as_str()).unwrap_or("");
-                    eprintln!("[bot] tool: web_search(\"{}\")", query);
-                    mcp_web_search(client, ai_key, query, mcp_session)
-                        .unwrap_or_else(|e| format!("Search error: {}", e))
-                }
-                _ => format!("Unknown tool: {}", fn_name),
-            };
-
-            messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": &tool_id,
-                "content": tool_result
-            }));
-        }
-    }
-
-    // Final call without tools to get answer
-    let result = call_ai(client, ai_key, &messages, None)?;
-    Ok(result.get("choices")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("No response")
-        .to_string())
-}
-
-/// Call ZAI glm-5-turbo chat completions API
-fn call_ai(
-    client: &reqwest::blocking::Client,
-    ai_key: &str,
-    messages: &[serde_json::Value],
-    tools: Option<&serde_json::Value>,
-) -> Result<serde_json::Value> {
-    let mut body = serde_json::json!({
-        "model": "glm-5-turbo",
-        "messages": messages,
-        "max_tokens": 4096,
-        "temperature": 0.7
-    });
-    if let Some(t) = tools {
-        body["tools"] = t.clone();
-    }
-
-    let resp = client.post("https://api.z.ai/api/coding/paas/v4/chat/completions")
-        .header("Authorization", format!("Bearer {}", ai_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .map_err(|e| anyhow::anyhow!("AI API error: {}", e))?;
-
-    let status = resp.status();
-    let text = resp.text().map_err(|e| anyhow::anyhow!("AI API read error: {}", e))?;
-
-    if !status.is_success() {
-        anyhow::bail!("AI API HTTP {}: {}", status, &text[..text.len().min(200)]);
-    }
-
-    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("AI response parse error: {}: {}...", e, &text[..text.len().min(100)]))
-}
-
-/// Search via ZAI MCP web_search_prime server (Streamable HTTP)
-fn mcp_web_search(
-    client: &reqwest::blocking::Client,
-    ai_key: &str,
-    query: &str,
-    mcp_session: &mut Option<String>,
-) -> Result<String> {
-    let mcp_url = "https://api.z.ai/api/mcp/web_search_prime/mcp";
-    let auth = format!("Bearer {}", ai_key);
-
-    // (Re)init session if needed
-    if mcp_session.is_none() {
-        let resp = client.post(mcp_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream")
-            .header("Authorization", &auth)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "inlayer-bot", "version": "1.0"}
-                }
-            }))
-            .send()
-            .map_err(|e| anyhow::anyhow!("MCP init error: {}", e))?;
-
-        let session = resp.headers().get("Mcp-Session-Id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        if let Some(sid) = session {
-            // Send initialized notification
-            let _ = client.post(mcp_url)
-                .header("Content-Type", "application/json")
-                .header("Authorization", &auth)
-                .header("Mcp-Session-Id", &sid)
-                .json(&serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
-                .send();
-            *mcp_session = Some(sid);
-            eprintln!("[bot] MCP session initialized");
-        } else {
-            anyhow::bail!("MCP init: no session ID in response");
-        }
-    }
-
-    // Execute search
-    let sid = mcp_session.as_ref().unwrap();
-    let resp = client.post(mcp_url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .header("Authorization", &auth)
-        .header("Mcp-Session-Id", sid)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {
-                "name": "web_search_prime",
-                "arguments": {"search_query": query}
-            }
-        }))
-        .send()
-        .map_err(|e| anyhow::anyhow!("MCP search error: {}", e))?;
-
-    let raw = resp.text().map_err(|e| anyhow::anyhow!("MCP read error: {}", e))?;
-
-    // Parse SSE response
-    for line in raw.split('\n') {
-        if !line.starts_with("data:") { continue; }
-        let json_str = line[5..].trim();
-        let obj: serde_json::Value = match serde_json::from_str(json_str) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if let Some(content) = obj.get("result").and_then(|r| r.get("content")).and_then(|c| c.as_array()) {
-            for c in content {
-                if c.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(text) = c.get("text").and_then(|t| t.as_str()) {
-                        // text is "\"[{...}]\"" — parse twice to get array
-                        if let Ok(level1) = serde_json::from_str::<serde_json::Value>(text) {
-                            let arr_str = if level1.is_string() {
-                                level1.as_str().unwrap_or("[]")
-                            } else {
-                                text
-                            };
-                            if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(arr_str) {
-                                let mut results = Vec::new();
-                                for item in items.iter().take(8) {
-                                    let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
-                                    let snippet = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                                    let url = item.get("link").and_then(|l| l.as_str()).unwrap_or("");
-                                    results.push(format!("- {} ({})\n  {}", title, url, &snippet[..snippet.len().min(200)]));
-                                }
-                                return Ok(results.join("\n\n"));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Session might be expired, force reinit next time
-    *mcp_session = None;
-    anyhow::bail!("MCP search returned no parseable results")
-}
-
 
 fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option<&str>) -> Result<()> {
     let cfg = Config::load(config_dir);
@@ -549,8 +369,6 @@ fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option
         max_execution_seconds: cfg.runner.max_execution_seconds,
     };
 
-    eprintln!("🔍 DEBUG: AI_API_KEY={}", std::env::var("AI_API_KEY").map(|v| format!("set({}chars)", v.len())).unwrap_or("NOT SET".into()));
-    eprintln!("🔍 DEBUG: TELEGRAM_BOT_TOKEN={}", std::env::var("TELEGRAM_BOT_TOKEN").map(|v| format!("set({}chars)", v.len())).unwrap_or("NOT SET".into()));
 
     let result = rt.block_on(executor.execute(
         &wasm_bytes,

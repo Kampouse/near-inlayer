@@ -466,7 +466,7 @@ impl outlayer::api::host::Host for OutlayerHostState {
         let body = serde_json::json!({
             "model": "glm-5-turbo",
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant inside a NEAR blockchain agent. Be concise. Respond in plain text."},
+                {"role": "system", "content": "You are a NEAR blockchain agent. For RPC calls, respond with JSON: {\"m\": \"method_name\", \"p\": \"param\"}. Methods: view_account, view_code, ft_balance_of, nft_tokens_for_owner, view_contract. Examples: {\"m\": \"view_account\", \"p\": \"kampouse.near\"}. For general questions, respond in plain text. Be concise."},
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": 2000
@@ -494,7 +494,81 @@ impl outlayer::api::host::Host for OutlayerHostState {
         eprintln!("[ai-chat] response len={}", content.len());
         Ok(content)
     }
+
+fn rpc_call(&mut self, method: String, params_json: String) -> Result<String, String> {
+        eprintln!("[rpc-call] method={}", method);
+        let rpc_url = std::env::var("NEAR_RPC_URL").unwrap_or_else(|_| "https://rpc.mainnet.near.org".into());
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("rpc-call client: {}", e))?;
+
+        let (rpc_method, rpc_params) = match method.as_str() {
+            "view_account" => {
+                let account = params_json.trim_matches('"');
+                ("query".into(), format!("[\"account/{}\",\"\"]", account))
+            }
+            "view_code" => {
+                let account = params_json.trim_matches('"');
+                ("query".into(), format!("[\"code/{}\",\"\"]", account))
+            }
+            "ft_balance_of" => {
+                let p: serde_json::Value = serde_json::from_str(&params_json).unwrap_or_default();
+                let contract = p.get("contract").and_then(|v| v.as_str()).unwrap_or("");
+                let account = p.get("account").and_then(|v| v.as_str()).unwrap_or("");
+                ("query".into(), format!("[\"call/{}\", \"ft_balance_of/{{\"account_id\": \"{}\"}}\"]", contract, account))
+            }
+            "nft_tokens_for_owner" => {
+                let p: serde_json::Value = serde_json::from_str(&params_json).unwrap_or_default();
+                let contract = p.get("contract").and_then(|v| v.as_str()).unwrap_or("");
+                let account = p.get("account").and_then(|v| v.as_str()).unwrap_or("");
+                ("query".into(), format!("[\"call/{}\", \"nft_tokens_for_owner/{{\"account_id\": \"{}\"}}\"]", contract, account))
+            }
+            "view_contract" => {
+                let p: serde_json::Value = serde_json::from_str(&params_json).unwrap_or_default();
+                let contract = p.get("contract").and_then(|v| v.as_str()).unwrap_or("");
+                let method_name = p.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let args = p.get("args").and_then(|v| v.as_str()).unwrap_or("{}");
+                ("query".into(), format!("[\"call/{}\", \"{}\"]", contract, method_name))
+            }
+            _ => {
+                (method.clone(), params_json.clone())
+            }
+        };
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": rpc_method,
+            "params": serde_json::from_str::<serde_json::Value>(&rpc_params).unwrap_or(serde_json::json!(rpc_params))
+        });
+        eprintln!("[rpc-call] req_body={}", body);
+
+        let resp = client.post(&rpc_url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .map_err(|e| format!("rpc-call request: {}", e))?;
+
+        let status = resp.status();
+        let resp_text: String = resp.text().map_err(|e| format!("rpc-call text: {}", e))?;
+        eprintln!("[rpc-call] HTTP {} len={}", status, resp_text.len());
+
+        if !status.is_success() {
+            return Err(format!("rpc-call HTTP {}: {}", status, &resp_text[..resp_text.len().min(200)]));
+        }
+
+        let resp_json: serde_json::Value = serde_json::from_str(&resp_text)
+            .unwrap_or(serde_json::json!({"raw": resp_text}));
+        if let Some(result) = resp_json.get("result") {
+            Ok(result.to_string())
+        } else {
+            Ok(resp_text)
+        }
+    }
 }
+
+
 
 /// Add outlayer host functions to a wasmtime component linker
 pub fn add_outlayer_to_linker<T: Send + 'static>(
