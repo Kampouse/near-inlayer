@@ -418,8 +418,9 @@ impl outlayer::api::host::Host for OutlayerHostState {
                             for item in arr {
                                 if item.get("type").and_then(|t| t.as_str()) == Some("text") {
                                     // MCP triple-encodes JSON: parse up to 3 times until we get an array
+                                    let text_val = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
                                     let mut parsed: serde_json::Value =
-                                        serde_json::Value::String(text.to_string());
+                                        serde_json::Value::String(text_val.to_string());
                                     for _ in 0..3 {
                                         if parsed.is_string() {
                                             if let Ok(inner) =
