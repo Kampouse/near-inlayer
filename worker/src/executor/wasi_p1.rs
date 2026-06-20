@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use tracing::debug;
 use wasmtime::*;
-use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::api_client::ResourceLimits;
@@ -75,22 +75,22 @@ pub async fn execute(
 
     // Try to load as module
     let module = wasmtime::Module::from_binary(engine, wasm_bytes)
-        .context("Not a valid WASI Preview 1 module")?;
+        .map_err(|e| anyhow::anyhow!("Not a valid WASI Preview 1 module: {}", e))?;
 
     debug!("Loaded as WASI Preview 1 module (wasmtime)");
 
     // Create linker for WASI P1
     let mut linker = wasmtime::Linker::new(engine);
-    preview1::add_to_linker_async(&mut linker, |t: &mut WasiP1Ctx| t)?;
+    wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t: &mut WasiP1Ctx| t)?;
 
     // Add outlayer http host functions
     add_outlayer_http(&mut linker)?;
 
     // Prepare stdin/stdout pipes
-    let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
+    let stdin_pipe = wasmtime_wasi::p2::pipe::MemoryInputPipe::new(input_data.to_vec());
     let stdout_pipe =
-        wasmtime_wasi::pipe::MemoryOutputPipe::new((limits.max_memory_mb as usize) * 1024 * 1024);
-    let stderr_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(1024 * 1024);
+        wasmtime_wasi::p2::pipe::MemoryOutputPipe::new((limits.max_memory_mb as usize) * 1024 * 1024);
+    let stderr_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(1024 * 1024);
 
     // Build WASI P1 context
     let mut wasi_builder = WasiCtxBuilder::new();
@@ -130,16 +130,16 @@ pub async fn execute(
     let instance = linker
         .instantiate_async(&mut store, &module)
         .await
-        .context("Failed to instantiate WASI P1 module")?;
+        .map_err(|e| anyhow::anyhow!("Failed to instantiate WASI P1 module: {}", e))?;
 
     // Get and call _start function (WASI entry point from main())
     debug!("Calling _start");
     let start = instance
         .get_typed_func::<(), ()>(&mut store, "_start")
-        .context(
-            "Failed to find _start function. \
-             Make sure you're using [[bin]] format with fn main(), not [lib] with cdylib",
-        )?;
+        .map_err(|e| anyhow::anyhow!(
+            "Failed to find _start function: {}. \
+             Make sure you're using [[bin]] format with fn main(), not [lib] with cdylib", e
+        ))?;
 
     let call_result = start.call_async(&mut store, ()).await;
     epoch_handle.abort();

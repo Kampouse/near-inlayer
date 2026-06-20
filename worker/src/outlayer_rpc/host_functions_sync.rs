@@ -23,13 +23,18 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use wasmtime::component::Linker;
+use wasmtime::component::{HasData, Linker};
 
 // Generate bindings from WIT - sync mode for simpler implementation
 wasmtime::component::bindgen!({
     path: "wit",
     world: "rpc-host",
 });
+
+struct RpcMarker;
+impl HasData for RpcMarker {
+    type Data<'a> = &'a mut RpcHostState;
+}
 
 /// SSRF protection: block internal/private IPs
 fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
@@ -979,7 +984,8 @@ impl near::rpc::api::Host for RpcHostState {
 /// Add NEAR RPC host functions to a wasmtime component linker
 pub fn add_rpc_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut RpcHostState + Send + Sync + Copy + 'static,
+    get_state: for<'a> fn(&'a mut T) -> &'a mut RpcHostState,
 ) -> anyhow::Result<()> {
-    near::rpc::api::add_to_linker(linker, get_state)
+    near::rpc::api::add_to_linker::<_, RpcMarker>(linker, get_state)
+        .map_err(|e| anyhow::anyhow!("wasmtime error: {}", e))?; Ok(())
 }

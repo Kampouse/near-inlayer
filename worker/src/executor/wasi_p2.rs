@@ -51,13 +51,15 @@ fn get_p2_engine() -> &'static Engine {
         Engine::new(&config).expect("Failed to create P2 WASM engine")
     })
 }
-use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi::bindings::Command;
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
-use wasmtime_wasi_http::body::HyperOutgoingBody;
-use wasmtime_wasi_http::types::{
-    default_send_request_handler, HostFutureIncomingResponse, OutgoingRequestConfig,
+use wasmtime_wasi::{DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::p2::bindings::Command;
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::{WasiHttpView, WasiHttpCtxView};
+use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::p2::types::{
+    HostFutureIncomingResponse, OutgoingRequestConfig,
 };
+use wasmtime_wasi_http::p2::default_send_request_handler;
 
 use crate::api_client::ResourceLimits;
 use crate::compiled_cache::CompiledCache;
@@ -83,48 +85,48 @@ struct HostState {
     storage_state: Option<StorageHostState>,
     /// Outlayer flat host state (for lisp-rlm P2 components using outlayer:api/host)
     outlayer_state: Option<crate::outlayer_flat::OutlayerHostState>,
-    /// Counter for timed-out HTTP requests (shared with spawned tasks)
-    http_timeout_count: Arc<std::sync::atomic::AtomicU32>,
-    /// Engine handle to force epoch interrupt when aborting due to HTTP abuse (Engine::clone is Arc)
-    engine_handle: &'static Engine,
+    /// HTTP hooks (for customizing wasi-http behavior)
+    http_hooks: HostHttpHooks,
 }
 
 impl WasiView for HostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
-    }
-
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.table,
+        }
     }
 }
 
 impl WasiHttpView for HostState {
-    fn ctx(&mut self) -> &mut WasiHttpCtx {
-        &mut self.wasi_http_ctx
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.wasi_http_ctx,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
+        }
     }
+}
 
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
+struct HostHttpHooks {
+    http_timeout_count: Arc<std::sync::atomic::AtomicU32>,
+    engine_handle: &'static Engine,
+}
 
-    /// Increase the max chunk size for outgoing HTTP request bodies
-    /// Default is too small for large attachments (wasi-http-client sends entire body in one write)
+impl wasmtime_wasi_http::p2::WasiHttpHooks for HostHttpHooks {
     fn outgoing_body_buffer_chunks(&mut self) -> usize {
-        tracing::trace!("outgoing_body_buffer_chunks: 16");
-        16 // Allow more buffered chunks (default is 1)
+        16
     }
 
     fn outgoing_body_chunk_size(&mut self) -> usize {
-        tracing::trace!("outgoing_body_chunk_size: 16MB");
-        16 * 1024 * 1024 // 16MB max per write (default might be too small)
+        16 * 1024 * 1024
     }
 
     fn send_request(
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
-    ) -> wasmtime_wasi_http::HttpResult<HostFutureIncomingResponse> {
+    ) -> wasmtime_wasi_http::p2::HttpResult<HostFutureIncomingResponse> {
         let timeout_count = self.http_timeout_count.clone();
         let engine = self.engine_handle; // &'static Engine
 
@@ -133,7 +135,7 @@ impl WasiHttpView for HostState {
         if current >= HTTP_TIMEOUT_ABORT_THRESHOLD {
             tracing::warn!("WASI HTTP aborted: {} requests timed out, refusing new requests", current);
             return Ok(HostFutureIncomingResponse::ready(Ok(Err(
-                wasmtime_wasi_http::bindings::http::types::ErrorCode::InternalError(
+                wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::InternalError(
                     Some(format!("Execution aborted: {} HTTP requests exceeded {}s timeout", current, HTTP_REQUEST_TIMEOUT_SECS))
                 )
             ))));
@@ -164,7 +166,7 @@ impl WasiHttpView for HostState {
                             engine.increment_epoch();
                         }
                     }
-                    Ok(Err(wasmtime_wasi_http::bindings::http::types::ErrorCode::ConnectionTimeout))
+                    Ok(Err(wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::ConnectionTimeout))
                 }
             }
         });
@@ -227,7 +229,7 @@ pub async fn execute(
             // Cache miss - compile from bytes
             debug!("🔨 Compiling component (cache miss): {}", checksum);
             let component = Component::from_binary(engine, wasm_bytes)
-                .context("Not a valid WASI Preview 2 component")?;
+                .map_err(|e| anyhow::anyhow!("Not a valid WASI Preview 2 component: {}", e))?;
 
             // Store in cache for next time
             if let Ok(mut c) = cache.lock() {
@@ -241,7 +243,7 @@ pub async fn execute(
     } else {
         // No cache available - compile directly
         Component::from_binary(engine, wasm_bytes)
-            .context("Not a valid WASI Preview 2 component")?
+            .map_err(|e| anyhow::anyhow!("Not a valid WASI Preview 2 component: {}", e))?
     };
 
     debug!("Loaded as WASI Preview 2 component");
@@ -255,8 +257,8 @@ pub async fn execute(
 
     // Create linker with WASI and HTTP support
     let mut linker: Linker<HostState> = Linker::new(engine);
-    wasmtime_wasi::add_to_linker_async(&mut linker)?;
-    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
 
     // Add NEAR RPC host functions if context has RPC proxy
     let rpc_state = if let Some(ctx) = exec_ctx {
@@ -351,10 +353,10 @@ pub async fn execute(
 
 
     // Prepare stdin/stdout/stderr pipes
-    let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
+    let stdin_pipe = wasmtime_wasi::p2::pipe::MemoryInputPipe::new(input_data.to_vec());
     let stdout_pipe =
-        wasmtime_wasi::pipe::MemoryOutputPipe::new((limits.max_memory_mb as usize) * 1024 * 1024);
-    let stderr_pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(1024 * 1024);
+        wasmtime_wasi::p2::pipe::MemoryOutputPipe::new((limits.max_memory_mb as usize) * 1024 * 1024);
+    let stderr_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(1024 * 1024);
 
     // Build WASI context
     let mut wasi_builder = WasiCtxBuilder::new();
@@ -384,6 +386,10 @@ pub async fn execute(
         debug!("Added env var: NEAR_RPC_PROXY_AVAILABLE=1");
     }
 
+    let http_hooks = HostHttpHooks {
+        http_timeout_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        engine_handle: engine,
+    };
     let host_state = HostState {
         wasi_ctx: wasi_builder.build(),
         wasi_http_ctx: WasiHttpCtx::new(),
@@ -391,8 +397,7 @@ pub async fn execute(
         rpc_state,
         storage_state,
         outlayer_state: Some(crate::outlayer_flat::OutlayerHostState::new()),
-        http_timeout_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        engine_handle: engine,
+        http_hooks,
     };
 
     // Create store with fuel limit + epoch deadline
@@ -421,9 +426,8 @@ pub async fn execute(
         .map_err(|e| {
             tracing::error!("Failed to instantiate component: {}", e);
             tracing::error!("Error details: {:?}", e);
-            e
-        })
-        .context("Failed to instantiate component")?;
+            anyhow::anyhow!("Failed to instantiate component: {}", e)
+        })?;
 
     debug!("Running wasi:cli/run");
     let execution_result = command
@@ -454,7 +458,7 @@ pub async fn execute(
     }
 
     // Check if execution was killed due to HTTP abuse (before checking result)
-    let http_timeouts = store.data().http_timeout_count.load(std::sync::atomic::Ordering::Relaxed);
+    let http_timeouts = store.data().http_hooks.http_timeout_count.load(std::sync::atomic::Ordering::Relaxed);
     if http_timeouts >= HTTP_TIMEOUT_ABORT_THRESHOLD {
         anyhow::bail!(
             "Execution terminated: {} HTTP requests exceeded {}s timeout limit (penalty). \

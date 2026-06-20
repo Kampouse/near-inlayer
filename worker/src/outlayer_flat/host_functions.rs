@@ -8,13 +8,18 @@ use anyhow::Result;
 use base64::Engine;
 use std::path::PathBuf;
 use tracing::debug;
-use wasmtime::component::Linker;
+use wasmtime::component::{HasData, Linker};
 
 // Generate typed bindings from WIT
 wasmtime::component::bindgen!({
     path: "wit-outlayer",
     world: "outlayer-world",
 });
+
+struct OutlayerMarker;
+impl HasData for OutlayerMarker {
+    type Data<'a> = &'a mut OutlayerHostState;
+}
 
 /// Host state for outlayer functions
 pub struct OutlayerHostState {
@@ -573,7 +578,8 @@ fn rpc_call(&mut self, method: String, params_json: String) -> Result<String, St
 /// Add outlayer host functions to a wasmtime component linker
 pub fn add_outlayer_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut OutlayerHostState + Send + Sync + Copy + 'static,
+    get_state: for<'a> fn(&'a mut T) -> &'a mut OutlayerHostState,
 ) -> Result<()> {
-    outlayer::api::host::add_to_linker(linker, get_state)
+    outlayer::api::host::add_to_linker::<_, OutlayerMarker>(linker, get_state)
+        .map_err(|e| anyhow::anyhow!("wasmtime error: {}", e))?; Ok(())
 }

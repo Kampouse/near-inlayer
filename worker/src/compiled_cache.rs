@@ -232,7 +232,7 @@ impl CompiledCache {
         // Serialize component to native code
         let compiled_bytes = component
             .serialize()
-            .context("Failed to serialize component")?;
+            .map_err(|e| anyhow::anyhow!("Failed to serialize component: {}", e))?;
 
         let size = compiled_bytes.len() as u64;
 

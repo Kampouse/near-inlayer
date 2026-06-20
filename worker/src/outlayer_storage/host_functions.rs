@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::debug;
-use wasmtime::component::Linker;
+use wasmtime::component::{HasData, Linker};
 
 use super::client::StorageClient;
 
@@ -19,6 +19,11 @@ wasmtime::component::bindgen!({
     path: "wit",
     world: "near:storage/storage-host",
 });
+
+struct StorageMarker;
+impl HasData for StorageMarker {
+    type Data<'a> = &'a mut StorageHostState;
+}
 
 /// Host state for storage functions
 pub struct StorageHostState {
@@ -247,7 +252,8 @@ impl near::storage::api::Host for StorageHostState {
 /// Add storage host functions to a wasmtime component linker
 pub fn add_storage_to_linker<T: Send + 'static>(
     linker: &mut Linker<T>,
-    get_state: impl Fn(&mut T) -> &mut StorageHostState + Send + Sync + Copy + 'static,
+    get_state: for<'a> fn(&'a mut T) -> &'a mut StorageHostState,
 ) -> Result<()> {
-    near::storage::api::add_to_linker(linker, get_state)
+    near::storage::api::add_to_linker::<_, StorageMarker>(linker, get_state)
+        .map_err(|e| anyhow::anyhow!("wasmtime error: {}", e))?; Ok(())
 }
